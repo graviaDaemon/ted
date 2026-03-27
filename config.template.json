@@ -1,0 +1,9 @@
+﻿{
+  "auth_endpoint": "",
+  "pub_endpoint": "",
+  "ws_endpoint": "",
+  "auth_ws_endpoint": "",
+  "key": "",
+  "secret": "",
+  "throttle_ms": 300
+}
