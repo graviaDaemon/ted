@@ -6,13 +6,6 @@ use crate::api::auth::sign_rest_request;
 use crate::api::types::{OrderResult, TradeSignal};
 use crate::config::config::Config;
 
-/// Places a EXCHANGE LIMIT order on Bitfinex via the authenticated REST API.
-///
-/// - Buy signal  → positive amount
-/// - Sell signal → negative amount
-///
-/// Returns `OrderResult` on success, or an error describing the failure.
-/// The caller is responsible for only calling this when `dry_run = false`.
 pub async fn place_order(
     signal: &TradeSignal,
     symbol: &str,
@@ -36,10 +29,7 @@ pub async fn place_order(
     .to_string();
 
     let url = format!("{}{}", config.auth_endpoint.trim_end_matches('/'), path);
-
-    // Retry up to 3 times on HTTP 429 (rate limited).
-    // A fresh nonce is generated on every attempt: Bitfinex requires strictly
-    // increasing nonces and will reject a reused value with a nonce error.
+    
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_status = reqwest::StatusCode::OK;
     let mut last_text   = String::new();
@@ -58,7 +48,6 @@ pub async fn place_order(
 
         last_status = response.status();
         if last_status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_ATTEMPTS {
-            // Respect Retry-After header if present, otherwise back off 1 s.
             let retry_after: u64 = response
                 .headers()
                 .get("Retry-After")
@@ -83,8 +72,7 @@ pub async fn place_order(
     if !http_status.is_success() {
         return Err(format!("HTTP {}: {}", http_status, text).into());
     }
-
-    // Bitfinex REST response: [MTS, "on-req", null, null, [[order_id, ...]], null, STATUS, TEXT]
+    
     let val: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("Failed to parse order response: {} — raw: {}", e, text))?;
 

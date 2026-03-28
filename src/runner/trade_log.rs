@@ -15,9 +15,6 @@ pub struct TradeEntry {
     pub dry_run: bool,
 }
 
-/// Maximum number of entries kept in memory.
-/// At 1-second ticks this covers ~28 hours. Older entries are dropped in
-/// batches of 10% when the cap is hit to amortise the drain cost.
 const MAX_ENTRIES: usize = 100_000;
 
 pub struct TradeLog {

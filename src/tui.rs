@@ -13,11 +13,6 @@ pub struct Tui {
     log_lines: Vec<String>,
 }
 
-// Layout (rows are 0-indexed):
-//   0 .. rows-4  : log area  (rows-3 lines, scrolls via log_lines buffer)
-//   rows-3       : separator ─────
-//   rows-2       : input line
-//   rows-1       : separator ─────
 
 impl Tui {
     pub fn enter() -> io::Result<Tui> {
@@ -37,7 +32,6 @@ impl Tui {
 
     pub fn exit(&self) {
         let _ = terminal::disable_raw_mode();
-        // Print a newline so the shell prompt appears on a fresh line after exit
         let _ = writeln!(io::stdout());
     }
 
@@ -51,8 +45,6 @@ impl Tui {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
-        // Only act on press events. Terminals on Windows also emit Release and
-        // Repeat events for every keypress, which would double every character.
         if key.kind != KeyEventKind::Press {
             return None;
         }
@@ -114,8 +106,6 @@ impl Tui {
             return;
         }
 
-        // Guard against terminals reporting the console buffer width instead of
-        // the visible window width (common on Windows in some configurations).
         let cols = cols.min(500) as usize;
         let sep = "─".repeat(cols);
 
@@ -124,7 +114,6 @@ impl Tui {
 
         let mut out = io::stdout();
 
-        // Paint log lines — one per row, filling from the top
         for row in 0..log_row_count {
             let _ = queue!(out, cursor::MoveTo(0, row as u16));
             let _ = write!(out, "\x1b[2K"); // erase full line
@@ -133,20 +122,16 @@ impl Tui {
                 let _ = write!(out, "{}", visible);
             }
         }
-
-        // Top separator
+        
         let _ = queue!(out, cursor::MoveTo(0, rows - 3));
         let _ = write!(out, "{}", sep);
-
-        // Input row
+        
         let _ = queue!(out, cursor::MoveTo(0, rows - 2));
         let _ = write!(out, "\x1b[2K{}{}", self.prompt, self.input_buf);
-
-        // Bottom separator
+        
         let _ = queue!(out, cursor::MoveTo(0, rows - 1));
         let _ = write!(out, "{}", sep);
 
-        // Leave cursor in the input line at the correct column
         let col = (self.prompt.len() + self.cursor_pos).min(cols) as u16;
         let _ = queue!(out, cursor::MoveTo(col, rows - 2));
 
