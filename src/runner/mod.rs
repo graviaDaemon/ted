@@ -33,13 +33,9 @@ pub struct RunnerState {
     pub live_order_ids: HashSet<i64>,
     pub http_client: reqwest::Client,
     pub last_order_time: Option<Instant>,
-    /// Maps a live order id to the grid price it was placed at, so that when the
-    /// exchange confirms the fill we can call `algo.on_fill` with the right price.
     pub pending_buy_orders: HashMap<i64, f64>,
     pub pending_sell_orders: HashMap<i64, f64>,
     pub trade_store: Option<crate::storage::TradeStore>,
-    /// Available wallet balances populated by the authenticated WebSocket channel.
-    /// Key is the currency code (e.g. "BTC", "USD"); value is the available balance.
     pub wallet_balances: HashMap<String, f64>,
 }
 
@@ -97,7 +93,6 @@ pub async fn run_runner(
         &format!("Runner started, algorithm: {}, mode: dry-run", algo_name),
     );
 
-    // Warn early if the symbol format is unrecognised — balance checks will be skipped.
     let (base_check, quote_check) = extract_currencies(&symbol);
     if base_check.is_empty() || quote_check.is_empty() {
         crate::logger::log(
@@ -257,9 +252,6 @@ pub async fn run_runner(
 
                     Some(RunnerControl::EnableLive) => {
                         state.dry_run = false;
-                        // Reset the algorithm so dry-run simulated fills don't carry
-                        // over. The next real tick will re-emit initial orders and place
-                        // them on the exchange as actual live orders.
                         state.algorithm.on_reconnect();
                         state.pending_buy_orders.clear();
                         state.pending_sell_orders.clear();
@@ -373,14 +365,10 @@ async fn process_event(state: &mut RunnerState, event: WsEvent) {
             );
         }
         WsEvent::Unknown => {}
-        // Authenticated-channel events are handled by process_auth_event; ignore here.
         _ => {}
     }
 }
 
-/// Enforces a minimum gap between consecutive live orders to avoid hitting
-/// the Bitfinex REST rate limit. The gap is read from `config.throttle_ms`
-/// (default 300 ms). Updates `last_order_time` after waiting.
 async fn throttle_order(last_order_time: &mut Option<Instant>, throttle_ms: u64) {
     let min_gap = Duration::from_millis(throttle_ms);
     if let Some(t) = *last_order_time {
@@ -472,7 +460,6 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                             quantity, price, reason
                         ),
                     );
-                    // Simulate an immediate fill so the algorithm seeds the buy side.
                     state.algorithm.on_fill(*price, false);
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);
@@ -546,7 +533,6 @@ async fn reconnect(
     let src = format!("RUNNER:{}", symbol);
 
     for attempt in 1..=MAX_ATTEMPTS {
-        // Exponential backoff: 2s, 4s, 8s, 16s, 30s, 30s, … (capped at 60s)
         let delay_secs = (2u64.pow(attempt - 1)).min(60);
         crate::logger::log(
             &src,
@@ -576,14 +562,6 @@ async fn reconnect(
     None
 }
 
-/// Drives the full disable → reconnect → re-enable cycle for the auth WebSocket.
-///
-/// On successful reconnect: cancels all live orders, resets algorithm state, and
-/// re-enables live trading with a fresh auth stream (disable + enable cycle ensures
-/// pending maps are clean and the grid starts fresh after the downtime).
-///
-/// On failure: cancels all live orders, falls back to dry-run, and logs a loud warning
-/// so the user knows to intervene.
 async fn handle_auth_reconnect(
     src: &str,
     symbol: &str,
@@ -593,15 +571,12 @@ async fn handle_auth_reconnect(
     let reconnected = reconnect_auth(symbol, &state.config, auth_stream).await;
 
     if reconnected {
-        // Pending maps are stale — we don't know what filled while disconnected.
-        // Safest recovery: cancel all open orders, reset algorithm, re-enable live.
         cancel_all_live_orders(state).await;
         state.algorithm.on_reconnect();
         state.pending_buy_orders.clear();
         state.pending_sell_orders.clear();
         state.dry_run = true;
 
-        // Re-connect the fresh auth stream and resume live trading.
         match connect_authenticated(&state.config).await {
             Ok(stream) => {
                 *auth_stream = Some(stream);
@@ -614,7 +589,6 @@ async fn handle_auth_reconnect(
             ),
         }
     } else {
-        // All retries exhausted — cancel everything, force dry-run, warn the user.
         crate::logger::log(src, "!!! Auth WS permanently failed — cancelling all live orders and disabling live trading !!!");
         cancel_all_live_orders(state).await;
         state.dry_run = true;
@@ -624,14 +598,11 @@ async fn handle_auth_reconnect(
     }
 }
 
-/// Attempts to reconnect the authenticated WebSocket.
-/// Returns `true` if reconnected successfully, `false` if all attempts exhausted.
 async fn reconnect_auth(
     symbol: &str,
     config: &Config,
     auth_stream: &mut Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 ) -> bool {
-    // Close any existing stream first.
     if let Some(mut s) = auth_stream.take() {
         let _ = s.close(None).await;
     }
@@ -640,7 +611,6 @@ async fn reconnect_auth(
     let src = format!("RUNNER:{}", symbol);
 
     for attempt in 1..=MAX_ATTEMPTS {
-        // Exponential backoff: 2s, 4s, 8s, 16s, 30s, 30s, … (capped at 30s)
         let delay_secs = (2u64.pow(attempt - 1)).min(30);
         crate::logger::log(
             &src,
@@ -748,15 +718,6 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
     }
 }
 
-/// Splits a Bitfinex symbol into `(base, quote)`.
-///
-/// Handles:
-/// - Colon-separated: `XAUT:USD` → `("XAUT", "USD")`
-/// - 6-char legacy:   `BTCUSD`   → `("BTC", "USD")`
-/// - Known-suffix scan for other lengths (e.g. 7/8-char pairs)
-///
-/// Returns empty strings for unrecognised formats and logs a warning — callers
-/// treat empty results as "unknown" and skip balance checks.
 fn extract_currencies(symbol: &str) -> (String, String) {
     if let Some(pos) = symbol.find(':') {
         return (symbol[..pos].to_string(), symbol[pos + 1..].to_string());
@@ -764,7 +725,6 @@ fn extract_currencies(symbol: &str) -> (String, String) {
     if symbol.len() == 6 {
         return (symbol[..3].to_string(), symbol[3..].to_string());
     }
-    // Known Bitfinex quote currencies for non-colon, non-6-char symbols.
     const KNOWN_QUOTES: &[&str] = &["USD", "UST", "EUR", "BTC", "ETH", "EOS", "XCH"];
     for q in KNOWN_QUOTES {
         if symbol.len() > q.len() && symbol.ends_with(q) {

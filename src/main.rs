@@ -293,6 +293,6 @@ async fn dispatch(
             }
         }
 
-        CliAction::Exit => {} // handled before dispatch() is called
+        CliAction::Exit => {}
     }
 }

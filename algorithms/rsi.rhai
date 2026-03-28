@@ -31,7 +31,6 @@ let prices = [];
 let last_rsi = 50.0;
 
 fn calc_rsi(prices, period) {
-    // needs period+1 prices to produce `period` diffs
     if prices.len() < period + 1 {
         return 50.0;
     }
@@ -64,7 +63,6 @@ fn calc_rsi(prices, period) {
 
 fn on_tick(price, bid, ask, volume) {
     prices.push(price);
-    // keep period+2 so the oldest diff is always available
     if prices.len() > period + 2 {
         prices.remove(0);
     }

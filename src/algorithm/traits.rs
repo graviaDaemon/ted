@@ -6,10 +6,6 @@ use crate::api::{MarketData, TradeSignal};
 pub trait Algorithm: Send {
     fn name(&self) -> &str;
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal>;
-    /// Called when an order placed from a signal is confirmed filled by the exchange.
-    /// In dry-run mode the runner calls this immediately after logging the signal,
-    /// simulating an instant fill. In live mode it is called when the authenticated
-    /// WebSocket delivers an `OrderFilled` event for the tracked order id.
     fn on_fill(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
     fn summary(&self) -> Option<String> { None }

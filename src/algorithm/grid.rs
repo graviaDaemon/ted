@@ -95,9 +95,7 @@ impl GridBot {
             total_sells: 0,
         })
     }
-
-    /// Derive the minimum decimal places needed to represent a price meaningfully.
-    /// Used to cross-check the user-supplied spacing precision.
+    
     fn decimals_from_price(price: f64) -> u32 {
         if price <= 0.0 { return 2; }
         let magnitude = price.log10().floor() as i32;
@@ -136,8 +134,6 @@ impl Algorithm for GridBot {
         let price = tick.last_price;
 
         if self.last_price.is_none() {
-            // Cross-check spacing-derived precision with the actual price magnitude.
-            // e.g. spacing="1" gives price_decimals=0, but a $0.50 asset needs at least 4 dp.
             let price_min = Self::decimals_from_price(price);
             if self.price_decimals < price_min {
                 crate::logger::log(
@@ -152,15 +148,8 @@ impl Algorithm for GridBot {
             self.build_grid(price);
 
             let mut signals: Vec<TradeSignal> = Vec::new();
-
-            // Emit a limit buy for every level below the current price so they are
-            // placed as resting orders on the exchange immediately at startup.
             let prec = self.price_decimals as usize;
-            // Collect all levels below current price, nearest first (reversed).
-            // Only place the single nearest buy as a live order; all others go into
-            // buy_orders so on_tick chains them progressively as price drops.
-            // This prevents self-trade conflicts: if the nearest buy fills and seeds
-            // a sell at level N+1, there must be no live buy sitting at level N+1.
+
             let mut buy_levels: Vec<(usize, f64)> = self.levels.iter()
                 .copied()
                 .enumerate()
@@ -179,13 +168,11 @@ impl Algorithm for GridBot {
                     price_decimals: self.price_decimals,
                 });
             }
-            // Park the rest in buy_orders — they will be placed when price dips to them.
+
             for &(i, _) in buy_levels.iter().skip(1) {
                 self.buy_orders.insert(i);
             }
 
-            // Emit limit sells for any pre-held base inventory supplied via initial_base.
-            // Without initial_base no sell orders are placed and the grid buys first.
             let max_sells = match self.initial_base {
                 None => 0,
                 Some(base) => {
@@ -262,8 +249,7 @@ impl Algorithm for GridBot {
             for idx in triggered {
                 let sell_price = self.levels[idx];
                 self.sell_orders.remove(&idx);
-                // Position update and opposite-side seeding are deferred to on_fill,
-                // which is called once the exchange confirms the order executed.
+
                 signals.push(TradeSignal::Sell {
                     price: sell_price,
                     quantity: self.quantity,
@@ -286,7 +272,7 @@ impl Algorithm for GridBot {
             for idx in triggered {
                 let buy_price = self.levels[idx];
                 self.buy_orders.remove(&idx);
-                // Position update and opposite-side seeding are deferred to on_fill.
+
                 signals.push(TradeSignal::Buy {
                     price: buy_price,
                     quantity: self.quantity,
@@ -304,7 +290,6 @@ impl Algorithm for GridBot {
     }
 
     fn on_fill(&mut self, price: f64, is_buy: bool) {
-        // Locate the grid level nearest to the filled price (within 1 % of spacing).
         let tolerance = self.spacing * 0.1;
         let idx = match self.levels.iter().position(|&l| (l - price).abs() < tolerance) {
             Some(i) => i,
