@@ -5,8 +5,6 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::Sender;
 use chrono::Utc;
 
-/// Rotate `path` if it is older than 24 hours.
-/// Archived file: `ted_<YYYY-MM-DD>.log`. Deletes archives older than 7 days.
 pub fn rotate_log(path: &str) {
     let active = PathBuf::from(path);
     if !active.exists() {
@@ -30,7 +28,6 @@ pub fn rotate_log(path: &str) {
             return;
         }
 
-        // Sweep archives older than 7 days.
         let prefix = format!("{}_", stem);
         if let Ok(entries) = std::fs::read_dir(".") {
             for entry in entries.filter_map(|e| e.ok()) {

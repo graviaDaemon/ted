@@ -23,7 +23,6 @@ pub enum TradeSignal {
     Sell { price: f64, quantity: f64, reason: String, price_decimals: u32 },
 }
 
-/// Result returned from a successful REST order submission.
 pub struct OrderResult {
     pub order_id: i64,
     pub status: String,
@@ -31,30 +30,19 @@ pub struct OrderResult {
 }
 
 pub enum WsEvent {
-    // ── Public channel events ─────────────────────────────────────────────
     TickerData(MarketData),
     Heartbeat,
     Info { maintenance: bool },
     Subscribed { chan_id: u64, symbol: String },
     Error { code: u32, message: String },
     Unknown,
-
-    // ── Authenticated channel events ──────────────────────────────────────
-    /// AUTH frame accepted by the exchange.
     AuthConfirmed,
-    /// AUTH frame rejected.
     AuthFailed { code: u32, message: String },
-    /// Initial snapshot of open order ids upon auth connect.
     OrderSnapshot { order_ids: Vec<i64> },
-    /// Exchange acknowledged a new order.
     #[allow(dead_code)]
     OrderNew { order_id: i64 },
-    /// Order fully executed (filled).
     OrderFilled { order_id: i64 },
-    /// Order cancelled.
     OrderCancelled { order_id: i64 },
-    /// Initial wallet balances snapshot: `(wallet_type, currency, available)`.
     WalletSnapshot { balances: Vec<(String, String, f64)> },
-    /// Incremental wallet balance update.
     WalletUpdate { wallet_type: String, currency: String, available: f64 },
 }

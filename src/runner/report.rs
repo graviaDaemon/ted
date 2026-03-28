@@ -176,17 +176,9 @@ fn price_range(entries: &[TradeEntry]) -> (f64, f64) {
     })
 }
 
-/// Computes net PnL across all signals, including the current value of any open position.
-///
-/// For each signal treated as a fill:
-///   Buy  → outflow of `price × qty` quote; gain `qty` base
-///   Sell → inflow  of `price × qty` quote; lose `qty` base
-///
-/// The remaining base position is valued at `last_price`, giving a realistic
-/// "close everything right now" figure rather than only counting completed round-trips.
 fn net_pnl(signals: &[&TradeEntry], last_price: f64) -> f64 {
-    let mut cash = 0.0_f64; // net quote currency flow
-    let mut pos  = 0.0_f64; // net base currency position
+    let mut cash = 0.0_f64;
+    let mut pos  = 0.0_f64;
 
     for e in signals {
         for sig in &e.signals {
@@ -200,8 +192,6 @@ fn net_pnl(signals: &[&TradeEntry], last_price: f64) -> f64 {
     cash + pos * last_price
 }
 
-/// Verbose breakdown of closed buy→sell round-trips in FIFO order.
-/// Does not include open positions — see "Est. PnL" in the summary table for that.
 fn pnl_breakdown(signals: &[&TradeEntry]) -> String {
     let mut md = String::from("## Closed Round-trips\n\n");
     md.push_str("| # | Buy Price | Sell Price | Qty | PnL |\n|---|---|---|---|---|\n");
