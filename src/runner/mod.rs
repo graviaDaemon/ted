@@ -115,8 +115,6 @@ pub async fn run_runner(
                                 chan_map.clear();
                                 chan_map.insert(new_chan, symbol.clone());
                                 state.algorithm.on_reconnect();
-                                state.pending_buy_orders.clear();
-                                state.pending_sell_orders.clear();
                                 crate::logger::log(&src, "Reconnected after timeout.");
                             }
                             None => {
@@ -149,8 +147,6 @@ pub async fn run_runner(
                                     chan_map.clear();
                                     chan_map.insert(new_chan, symbol.clone());
                                     state.algorithm.on_reconnect();
-                                    state.pending_buy_orders.clear();
-                                    state.pending_sell_orders.clear();
                                     crate::logger::log(&src, "Reconnected.");
                                 }
                                 None => {
@@ -170,8 +166,6 @@ pub async fn run_runner(
                                     chan_map.clear();
                                     chan_map.insert(new_chan, symbol.clone());
                                     state.algorithm.on_reconnect();
-                                    state.pending_buy_orders.clear();
-                                    state.pending_sell_orders.clear();
                                     crate::logger::log(&src, "Reconnected.");
                                 }
                                 None => {
@@ -428,6 +422,13 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                         );
                         continue;
                     }
+                    if state.pending_buy_orders.values().any(|&p| (p - price).abs() < 1e-6) {
+                        crate::logger::log(
+                            &src,
+                            &format!("[LIVE] Buy at {:.2} already pending — skipping duplicate.", price),
+                        );
+                        continue;
+                    }
                     throttle_order(&mut state.last_order_time, state.config.throttle_ms).await;
                     crate::logger::log(
                         &src,
@@ -473,6 +474,13 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                                 "[LIVE] Insufficient {} ({:.8} < {:.8}) — skipping SELL.",
                                 base, bal, quantity
                             ),
+                        );
+                        continue;
+                    }
+                    if state.pending_sell_orders.values().any(|&p| (p - price).abs() < 1e-6) {
+                        crate::logger::log(
+                            &src,
+                            &format!("[LIVE] Sell at {:.2} already pending — skipping duplicate.", price),
                         );
                         continue;
                     }
@@ -657,6 +665,8 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
                 .collect();
             for id in &stale {
                 state.live_order_ids.remove(id);
+                state.pending_buy_orders.remove(id);
+                state.pending_sell_orders.remove(id);
             }
             if !stale.is_empty() {
                 crate::logger::log(

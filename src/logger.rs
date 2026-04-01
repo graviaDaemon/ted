@@ -3,61 +3,71 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::Sender;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 
-pub fn rotate_log(path: &str) {
-    let active = PathBuf::from(path);
-    if !active.exists() {
+struct LogState {
+    file: std::fs::File,
+    date: String,
+}
+
+static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
+static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
+
+fn log_path_for(date: &str) -> PathBuf {
+    PathBuf::from(format!("logs/ted_{}.log", date))
+}
+
+fn archive_old_logs(retention: u32) {
+    if retention == 0 {
         return;
     }
-    let age = active
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.elapsed().ok())
-        .unwrap_or(std::time::Duration::ZERO);
-
-    if age > std::time::Duration::from_secs(24 * 3600) {
-        let stem = active
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ted");
-        let archive = format!("{}_{}.log", stem, Utc::now().format("%Y-%m-%d"));
-        if let Err(e) = std::fs::rename(&active, &archive) {
-            eprintln!("[LOGGER] Failed to rotate {}: {}", path, e);
+    if let Err(e) = std::fs::create_dir_all("logs/archive") {
+        eprintln!("[LOGGER] Failed to create logs/archive: {}", e);
+        return;
+    }
+    let entries = match std::fs::read_dir("logs") {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[LOGGER] Failed to read logs/: {}", e);
             return;
         }
-
-        let prefix = format!("{}_", stem);
-        if let Ok(entries) = std::fs::read_dir(".") {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&prefix) && name.ends_with(".log") && name != archive {
-                    let old = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.elapsed().ok())
-                        .unwrap_or(std::time::Duration::ZERO);
-                    if old > std::time::Duration::from_secs(7 * 24 * 3600) {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
+    };
+    let today = Utc::now().date_naive();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("ted_") || !name.ends_with(".log") {
+            continue;
+        }
+        let date_str = &name["ted_".len()..name.len() - ".log".len()];
+        let parsed = match NaiveDate::parse_from_str(date_str, "%d-%m-%Y") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if (today - parsed).num_days() <= retention as i64 {
+            continue;
+        }
+        let src = entry.path();
+        let dest = PathBuf::from(format!("logs/archive/{}", name));
+        if std::fs::rename(&src, &dest).is_err() {
+            if std::fs::copy(&src, &dest).is_ok() {
+                let _ = std::fs::remove_file(&src);
+            } else {
+                eprintln!("[LOGGER] Failed to archive {}", name);
             }
         }
     }
 }
 
-static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
-
-pub fn init(path: &str, tx: Sender<String>) -> io::Result<()> {
+pub fn init(tx: Sender<String>, retention: u32) -> io::Result<()> {
+    std::fs::create_dir_all("logs")?;
+    let today = Utc::now().format("%d-%m-%Y").to_string();
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
-    LOG_FILE
-        .set(Mutex::new(file))
+        .open(log_path_for(&today))?;
+    archive_old_logs(retention);
+    LOG_STATE
+        .set(Mutex::new(LogState { file, date: today }))
         .map_err(|_| io::Error::other("Logger already initialised"))?;
     let _ = LOG_TX.set(tx);
     Ok(())
@@ -75,10 +85,20 @@ pub fn log(source: &str, msg: &str) {
         let _ = tx.try_send(line.clone());
     }
 
-    if let Some(lock) = LOG_FILE.get()
-        && let Ok(mut file) = lock.lock()
+    if let Some(lock) = LOG_STATE.get()
+        && let Ok(mut state) = lock.lock()
     {
-        if let Err(e) = file.write_all(line.as_bytes()) {
+        let today = Utc::now().format("%d-%m-%Y").to_string();
+        if state.date != today {
+            match OpenOptions::new().create(true).append(true).open(log_path_for(&today)) {
+                Ok(new_file) => {
+                    state.file = new_file;
+                    state.date = today;
+                }
+                Err(e) => eprintln!("[LOGGER] Failed to open new log file: {}", e),
+            }
+        }
+        if let Err(e) = state.file.write_all(line.as_bytes()) {
             eprintln!("[LOGGER WRITE ERROR] {}: {}", e, line.trim());
         }
     }

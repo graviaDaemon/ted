@@ -134,6 +134,32 @@ impl Algorithm for GridBot {
         let price = tick.last_price;
 
         if self.last_price.is_none() {
+            if !self.levels.is_empty() && price >= self.lower && price <= self.upper {
+                crate::logger::log(
+                    "[GRID]",
+                    &format!(
+                        "Soft resume at {:.2} — grid [{:.2}–{:.2}] intact.",
+                        price, self.lower, self.upper
+                    ),
+                );
+                self.last_price = Some(price);
+                return vec![];
+            }
+
+            if !self.levels.is_empty() {
+                crate::logger::log(
+                    "[GRID]",
+                    &format!(
+                        "Price {:.2} outside preserved grid [{:.2}–{:.2}] — rebuilding.",
+                        price, self.lower, self.upper
+                    ),
+                );
+                self.levels.clear();
+                self.buy_orders.clear();
+                self.sell_orders.clear();
+                self.seeded_sells.clear();
+            }
+
             let price_min = Self::decimals_from_price(price);
             if self.price_decimals < price_min {
                 crate::logger::log(
@@ -337,13 +363,17 @@ impl Algorithm for GridBot {
 
     fn on_reconnect(&mut self) {
         self.last_price = None;
-        self.lower = 0.0;
-        self.upper = 0.0;
-        self.levels.clear();
-        self.buy_orders.clear();
-        self.sell_orders.clear();
-        self.seeded_sells.clear();
-        crate::logger::log("[GRID]", "Reconnected — grid reset. Will re-centre on next tick.");
+        if self.levels.is_empty() {
+            crate::logger::log("[GRID]", "Reconnected — no grid built yet, will initialise on next tick.");
+        } else {
+            crate::logger::log(
+                "[GRID]",
+                &format!(
+                    "Reconnected — grid preserved ({:.2}–{:.2}), resuming on next tick.",
+                    self.lower, self.upper
+                ),
+            );
+        }
     }
 
     fn summary(&self) -> Option<String> {
