@@ -246,7 +246,7 @@ pub async fn run_runner(
 
                     Some(RunnerControl::EnableLive) => {
                         state.dry_run = false;
-                        state.algorithm.on_reconnect();
+                        state.algorithm.on_live_enabled();
                         state.pending_buy_orders.clear();
                         state.pending_sell_orders.clear();
                         crate::logger::log(

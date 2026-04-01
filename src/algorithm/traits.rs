@@ -1,14 +1,17 @@
-use std::collections::HashMap;
 use crate::algorithm::GridBot;
 use crate::algorithm::PassiveObserver;
 use crate::api::{MarketData, TradeSignal};
+use std::collections::HashMap;
 
 pub trait Algorithm: Send {
     fn name(&self) -> &str;
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal>;
     fn on_fill(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
-    fn summary(&self) -> Option<String> { None }
+    fn on_live_enabled(&mut self) {}
+    fn summary(&self) -> Option<String> {
+        None
+    }
 }
 
 type AlgoBuilder = fn(&HashMap<String, String>) -> Result<Box<dyn Algorithm>, String>;
@@ -19,8 +22,14 @@ struct AlgoEntry {
 }
 
 static BUILTIN_REGISTRY: &[AlgoEntry] = &[
-    AlgoEntry { name: "passive", build: |_| Ok(Box::new(PassiveObserver::new())) },
-    AlgoEntry { name: "grid",    build: |o| GridBot::new(o).map(|g| Box::new(g) as _) },
+    AlgoEntry {
+        name: "passive",
+        build: |_| Ok(Box::new(PassiveObserver::new())),
+    },
+    AlgoEntry {
+        name: "grid",
+        build: |o| GridBot::new(o).map(|g| Box::new(g) as _),
+    },
 ];
 
 pub fn build_algorithm(
@@ -29,7 +38,10 @@ pub fn build_algorithm(
 ) -> Result<Box<dyn Algorithm>, String> {
     let key = if name.is_empty() { "passive" } else { name };
 
-    if let Some(entry) = BUILTIN_REGISTRY.iter().find(|e| e.name.eq_ignore_ascii_case(key)) {
+    if let Some(entry) = BUILTIN_REGISTRY
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(key))
+    {
         return (entry.build)(options);
     }
 

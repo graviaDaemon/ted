@@ -399,9 +399,6 @@ impl Algorithm for GridBot {
     }
 
     fn on_reconnect(&mut self) {
-        self.buy_orders.clear();
-        self.sell_orders.clear();
-        self.seeded_sells.clear();
         self.last_price = None;
         if self.levels.is_empty() {
             crate::logger::log(
@@ -417,6 +414,18 @@ impl Algorithm for GridBot {
                 ),
             );
         }
+    }
+
+    fn on_live_enabled(&mut self) {
+        self.buy_orders.clear();
+        self.sell_orders.clear();
+        self.seeded_sells.clear();
+        self.levels.clear();
+        self.last_price = None;
+        crate::logger::log(
+            "[GRID]",
+            "Live enabled — grid reset, will rebuild on next tick.",
+        );
     }
 
     fn summary(&self) -> Option<String> {

@@ -5,7 +5,7 @@ DISCLAIMER: AI has been used as a tool to fix some bugs, and streamline some of 
 As well as writing parts of this README.md
 
 ---
-![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-1.0.1-green)
+![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-1.0.3-green)
 
 A Rust-based algorithmic trading daemon for the Bitfinex exchange. Connects to the Bitfinex WebSocket v2 API, streams live market data, and executes configurable trading strategies.
 
