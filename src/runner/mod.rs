@@ -429,6 +429,13 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                         );
                         continue;
                     }
+                    if market_data.bid > 0.0 && market_data.ask > 0.0 && *price >= market_data.ask {
+                        crate::logger::log(
+                            &src,
+                            &format!("[LIVE] Buy at {:.2} would cross the spread (ask={:.2}) — skipping.", price, market_data.ask),
+                        );
+                        continue;
+                    }
                     throttle_order(&mut state.last_order_time, state.config.throttle_ms).await;
                     crate::logger::log(
                         &src,
@@ -481,6 +488,13 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                         crate::logger::log(
                             &src,
                             &format!("[LIVE] Sell at {:.2} already pending — skipping duplicate.", price),
+                        );
+                        continue;
+                    }
+                    if market_data.bid > 0.0 && market_data.ask > 0.0 && *price <= market_data.bid {
+                        crate::logger::log(
+                            &src,
+                            &format!("[LIVE] Sell at {:.2} would cross the spread (bid={:.2}) — skipping.", price, market_data.bid),
                         );
                         continue;
                     }
@@ -703,9 +717,12 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
             crate::logger::log(&src, &format!("Order {} cancelled — removed from live tracking.", order_id));
         }
         WsEvent::WalletSnapshot { balances } => {
+            let (base, quote) = extract_currencies(&state.symbol);
             state.wallet_balances.clear();
             for (wallet_type, currency, available) in balances {
-                if wallet_type == "exchange" {
+                if wallet_type == "exchange"
+                    && (base.is_empty() || quote.is_empty() || currency == base || currency == quote)
+                {
                     state.wallet_balances.insert(currency, available);
                 }
             }
@@ -716,11 +733,14 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
         }
         WsEvent::WalletUpdate { wallet_type, currency, available } => {
             if wallet_type == "exchange" {
-                state.wallet_balances.insert(currency.clone(), available);
-                crate::logger::log(
-                    &src,
-                    &format!("Wallet update: {} available = {:.8}", currency, available),
-                );
+                let (base, quote) = extract_currencies(&state.symbol);
+                if base.is_empty() || quote.is_empty() || currency == base || currency == quote {
+                    state.wallet_balances.insert(currency.clone(), available);
+                    crate::logger::log(
+                        &src,
+                        &format!("Wallet update: {} available = {:.8}", currency, available),
+                    );
+                }
             }
         }
         WsEvent::Heartbeat => {}

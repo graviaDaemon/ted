@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use crate::algorithm::Algorithm;
 use crate::api::{MarketData, TradeSignal};
+use std::collections::{HashMap, HashSet};
 
 pub struct GridBot {
     num_levels: u32,
@@ -97,13 +97,15 @@ impl GridBot {
     }
 
     fn decimals_from_price(price: f64) -> u32 {
-        if price <= 0.0 { return 2; }
+        if price <= 0.0 {
+            return 2;
+        }
         let magnitude = price.log10().floor() as i32;
         match magnitude {
-            m if m >= 2  => 2,   // $100+   → 2 dp
-            m if m >= 0  => 4,   // $1–$99  → 4 dp
-            m if m >= -2 => 6,   // $0.01–$0.99 → 6 dp
-            _            => 8,   // sub-cent → 8 dp
+            m if m >= 2 => 2,  // $100+   → 2 dp
+            m if m >= 0 => 4,  // $1–$99  → 4 dp
+            m if m >= -2 => 6, // $0.01–$0.99 → 6 dp
+            _ => 8,            // sub-cent → 8 dp
         }
     }
 
@@ -122,6 +124,15 @@ impl GridBot {
                 self.lower, self.upper, self.num_levels, self.spacing
             ),
         );
+        if self.lower <= 0.0 {
+            crate::logger::log(
+                "[GRID]",
+                &format!(
+                    "Warning: spacing {:.6} at price {:.6} produces a lower bound of {:.6} — lower grid levels will be skipped. Consider reducing spacing.",
+                    self.spacing, price, self.lower
+                ),
+            );
+        }
     }
 }
 
@@ -176,10 +187,12 @@ impl Algorithm for GridBot {
             let mut signals: Vec<TradeSignal> = Vec::new();
             let prec = self.price_decimals as usize;
 
-            let mut buy_levels: Vec<(usize, f64)> = self.levels.iter()
+            let mut buy_levels: Vec<(usize, f64)> = self
+                .levels
+                .iter()
                 .copied()
                 .enumerate()
-                .filter(|&(_, level)| level < price)
+                .filter(|&(_, level)| level < price && level > 0.0)
                 .collect();
             buy_levels.reverse(); // nearest first
 
@@ -189,7 +202,10 @@ impl Algorithm for GridBot {
                     quantity: self.quantity,
                     reason: format!(
                         "Grid initial buy at {:.prec$} (level {}/{})",
-                        level, i, self.num_levels, prec = prec
+                        level,
+                        i,
+                        self.num_levels,
+                        prec = prec
                     ),
                     price_decimals: self.price_decimals,
                 });
@@ -220,14 +236,17 @@ impl Algorithm for GridBot {
 
             let mut seeded = 0;
             for (i, &level) in self.levels.iter().enumerate() {
-                if level > price && seeded < max_sells {
+                if level > price && level > 0.0 && seeded < max_sells {
                     self.seeded_sells.insert(i);
                     signals.push(TradeSignal::Sell {
                         price: level,
                         quantity: self.quantity,
                         reason: format!(
                             "Grid initial sell at {:.prec$} (level {}/{})",
-                            level, i, self.num_levels, prec = prec
+                            level,
+                            i,
+                            self.num_levels,
+                            prec = prec
                         ),
                         price_decimals: self.price_decimals,
                     });
@@ -239,8 +258,14 @@ impl Algorithm for GridBot {
                 "[GRID]",
                 &format!(
                     "Initial orders: {} buy(s), {} sell(s) — grid active.",
-                    signals.iter().filter(|s| matches!(s, TradeSignal::Buy { .. })).count(),
-                    signals.iter().filter(|s| matches!(s, TradeSignal::Sell { .. })).count(),
+                    signals
+                        .iter()
+                        .filter(|s| matches!(s, TradeSignal::Buy { .. }))
+                        .count(),
+                    signals
+                        .iter()
+                        .filter(|s| matches!(s, TradeSignal::Sell { .. }))
+                        .count(),
                 ),
             );
 
@@ -281,7 +306,10 @@ impl Algorithm for GridBot {
                     quantity: self.quantity,
                     reason: format!(
                         "Grid sell at {:.prec$} (level {}/{})",
-                        sell_price, idx, self.num_levels, prec = self.price_decimals as usize
+                        sell_price,
+                        idx,
+                        self.num_levels,
+                        prec = self.price_decimals as usize
                     ),
                     price_decimals: self.price_decimals,
                 });
@@ -304,7 +332,10 @@ impl Algorithm for GridBot {
                     quantity: self.quantity,
                     reason: format!(
                         "Grid buy at {:.prec$} (level {}/{})",
-                        buy_price, idx, self.num_levels, prec = self.price_decimals as usize
+                        buy_price,
+                        idx,
+                        self.num_levels,
+                        prec = self.price_decimals as usize
                     ),
                     price_decimals: self.price_decimals,
                 });
@@ -317,7 +348,11 @@ impl Algorithm for GridBot {
 
     fn on_fill(&mut self, price: f64, is_buy: bool) {
         let tolerance = self.spacing * 0.1;
-        let idx = match self.levels.iter().position(|&l| (l - price).abs() < tolerance) {
+        let idx = match self
+            .levels
+            .iter()
+            .position(|&l| (l - price).abs() < tolerance)
+        {
             Some(i) => i,
             None => {
                 crate::logger::log(
@@ -337,7 +372,8 @@ impl Algorithm for GridBot {
                     "[GRID]",
                     &format!(
                         "Buy filled @ {:.6} — sell seeded at {:.6}",
-                        price, self.levels[idx + 1]
+                        price,
+                        self.levels[idx + 1]
                     ),
                 );
             }
@@ -354,7 +390,8 @@ impl Algorithm for GridBot {
                     "[GRID]",
                     &format!(
                         "Sell filled @ {:.6} — buy seeded at {:.6}",
-                        price, self.levels[idx - 1]
+                        price,
+                        self.levels[idx - 1]
                     ),
                 );
             }
@@ -362,9 +399,15 @@ impl Algorithm for GridBot {
     }
 
     fn on_reconnect(&mut self) {
+        self.buy_orders.clear();
+        self.sell_orders.clear();
+        self.seeded_sells.clear();
         self.last_price = None;
         if self.levels.is_empty() {
-            crate::logger::log("[GRID]", "Reconnected — no grid built yet, will initialise on next tick.");
+            crate::logger::log(
+                "[GRID]",
+                "Reconnected — no grid built yet, will initialise on next tick.",
+            );
         } else {
             crate::logger::log(
                 "[GRID]",
