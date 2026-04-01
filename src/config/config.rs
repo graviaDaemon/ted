@@ -1,6 +1,7 @@
 ﻿use serde::Deserialize;
 
 fn default_throttle_ms() -> u64 { 300 }
+fn default_retention() -> u32 { 7 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
@@ -13,6 +14,8 @@ pub struct Config {
     pub secret: String,
     #[serde(default = "default_throttle_ms")]
     pub throttle_ms: u64,
+    #[serde(default = "default_retention")]
+    pub retention: u32,
 }
 
 impl Config {

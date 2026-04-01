@@ -26,9 +26,14 @@ use tokio::time::timeout;
 async fn main() {
     let (log_tx, mut log_rx) = channel::<String>(256);
 
-    logger::rotate_log("ted.log");
-    if let Err(e) = logger::init("ted.log", log_tx) {
-        eprintln!("Warning: could not open ted.log for writing: {}", e);
+    let config = Config::load_config("config.json").expect("Failed to load config.json");
+    if let Err(e) = validate_config(&config) {
+        eprintln!("Invalid config.json: {}", e);
+        std::process::exit(1);
+    }
+
+    if let Err(e) = logger::init(log_tx, config.retention) {
+        eprintln!("Warning: could not initialise log file: {}", e);
     }
 
     let script_registry = crate::algorithm::script::init_script_registry("algorithms");
@@ -41,12 +46,6 @@ async fn main() {
         }
     }
     tokio::spawn(crate::algorithm::script::watch_algorithms("algorithms", script_registry));
-
-    let config = Config::load_config("config.json").expect("Failed to load config.json");
-    if let Err(e) = validate_config(&config) {
-        eprintln!("Invalid config.json: {}", e);
-        std::process::exit(1);
-    }
     let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
     let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
 
