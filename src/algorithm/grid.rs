@@ -95,7 +95,7 @@ impl GridBot {
             total_sells: 0,
         })
     }
-    
+
     fn decimals_from_price(price: f64) -> u32 {
         if price <= 0.0 { return 2; }
         let magnitude = price.log10().floor() as i32;
