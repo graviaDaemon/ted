@@ -593,17 +593,13 @@ async fn handle_auth_reconnect(
     let reconnected = reconnect_auth(symbol, &state.config, auth_stream).await;
 
     if reconnected {
-        cancel_all_live_orders(state).await;
-        state.algorithm.on_reconnect();
-        state.pending_buy_orders.clear();
-        state.pending_sell_orders.clear();
         state.dry_run = true;
 
         match connect_authenticated(&state.config).await {
             Ok(stream) => {
                 *auth_stream = Some(stream);
                 state.dry_run = false;
-                crate::logger::log(src, "Auth WS recovered — live trading resumed. Orders reset.");
+                crate::logger::log(src, "Auth WS recovered — live trading resumed. Open orders preserved.");
             }
             Err(e) => crate::logger::log(
                 src,
@@ -674,13 +670,34 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
         }
         WsEvent::OrderSnapshot { order_ids } => {
             let snapshot: HashSet<i64> = order_ids.into_iter().collect();
+
+            let filled_buys: Vec<(i64, f64)> = state.pending_buy_orders.iter()
+                .filter(|(id, _)| !snapshot.contains(*id))
+                .map(|(&id, &price)| (id, price))
+                .collect();
+            let filled_sells: Vec<(i64, f64)> = state.pending_sell_orders.iter()
+                .filter(|(id, _)| !snapshot.contains(*id))
+                .map(|(&id, &price)| (id, price))
+                .collect();
+
+            for (id, price) in &filled_buys {
+                state.live_order_ids.remove(id);
+                state.pending_buy_orders.remove(id);
+                state.algorithm.on_fill(*price, true);
+                crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
+            }
+            for (id, price) in &filled_sells {
+                state.live_order_ids.remove(id);
+                state.pending_sell_orders.remove(id);
+                state.algorithm.on_fill(*price, false);
+                crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
+            }
+
             let stale: Vec<i64> = state.live_order_ids.iter().copied()
                 .filter(|id| !snapshot.contains(id))
                 .collect();
             for id in &stale {
                 state.live_order_ids.remove(id);
-                state.pending_buy_orders.remove(id);
-                state.pending_sell_orders.remove(id);
             }
             if !stale.is_empty() {
                 crate::logger::log(

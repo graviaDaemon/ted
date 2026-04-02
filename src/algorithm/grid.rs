@@ -281,7 +281,7 @@ impl Algorithm for GridBot {
                     price, self.lower, self.upper
                 ),
             );
-            self.last_price = Some(price);
+            self.last_price = None;
             return vec![];
         }
 
