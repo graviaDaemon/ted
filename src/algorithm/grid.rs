@@ -250,6 +250,12 @@ impl Algorithm for GridBot {
             return signals;
         }
 
+        if self.buy_orders.is_empty() && self.sell_orders.is_empty() {
+            let signals = self.build_grid(price);
+            self.last_price = Some(price);
+            return signals;
+        }
+
         let lower = self.grid_lower().unwrap_or(0.0);
         let upper = self.grid_upper().unwrap_or(f64::MAX);
         if (!self.buy_orders.is_empty() && price < lower * 0.95)
@@ -315,6 +321,7 @@ impl Algorithm for GridBot {
         let m = 10_f64.powi(self.price_decimals as i32);
 
         if is_buy {
+            self.buy_orders.remove(&self.price_key(price));
             self.position += self.qty;
             self.total_buys += 1;
 
@@ -322,36 +329,31 @@ impl Algorithm for GridBot {
             self.sell_orders
                 .insert(self.price_key(sell_price), sell_price);
 
-            if let Some(min_buy) = self.buy_orders.values().copied().reduce(f64::min) {
-                let replenish = ((min_buy - self.spacing) * m).round() / m;
-                if replenish > 0.0 {
-                    self.buy_orders.insert(self.price_key(replenish), replenish);
-                    crate::logger::log(
-                        "[GRID]",
-                        &format!(
-                            "Buy filled @ {:.prec$} — sell seeded at {:.prec$}, buy replenished at {:.prec$}",
-                            price, sell_price, replenish, prec = self.price_decimals as usize
-                        ),
-                    );
-                } else {
-                    crate::logger::log(
-                        "[GRID]",
-                        &format!(
-                            "Buy filled @ {:.prec$} — sell seeded at {:.prec$} (replenish skipped: price would go <= 0)",
-                            price, sell_price, prec = self.price_decimals as usize
-                        ),
-                    );
-                }
+            let replenish = if let Some(min_buy) = self.buy_orders.values().copied().reduce(f64::min) {
+                ((min_buy - self.spacing) * m).round() / m
+            } else {
+                ((price - self.spacing) * m).round() / m
+            };
+            if replenish > 0.0 {
+                self.buy_orders.insert(self.price_key(replenish), replenish);
+                crate::logger::log(
+                    "[GRID]",
+                    &format!(
+                        "Buy filled @ {:.prec$} — sell seeded at {:.prec$}, buy replenished at {:.prec$}",
+                        price, sell_price, replenish, prec = self.price_decimals as usize
+                    ),
+                );
             } else {
                 crate::logger::log(
                     "[GRID]",
                     &format!(
-                        "Buy filled @ {:.prec$} — sell seeded at {:.prec$} (no remaining buys to replenish from)",
+                        "Buy filled @ {:.prec$} — sell seeded at {:.prec$} (replenish skipped: price would go <= 0)",
                         price, sell_price, prec = self.price_decimals as usize
                     ),
                 );
             }
         } else {
+            self.sell_orders.remove(&self.price_key(price));
             self.position -= self.qty;
             self.total_sells += 1;
             self.realized_pnl += self.spacing * self.qty;
@@ -361,26 +363,19 @@ impl Algorithm for GridBot {
                 self.buy_orders.insert(self.price_key(buy_price), buy_price);
             }
 
-            if let Some(max_sell) = self.sell_orders.values().copied().reduce(f64::max) {
-                let replenish = ((max_sell + self.spacing) * m).round() / m;
-                self.sell_orders
-                    .insert(self.price_key(replenish), replenish);
-                crate::logger::log(
-                    "[GRID]",
-                    &format!(
-                        "Sell filled @ {:.prec$} — buy seeded at {:.prec$}, sell replenished at {:.prec$}",
-                        price, buy_price, replenish, prec = self.price_decimals as usize
-                    ),
-                );
+            let replenish = if let Some(max_sell) = self.sell_orders.values().copied().reduce(f64::max) {
+                ((max_sell + self.spacing) * m).round() / m
             } else {
-                crate::logger::log(
-                    "[GRID]",
-                    &format!(
-                        "Sell filled @ {:.prec$} — buy seeded at {:.prec$} (no remaining sells to replenish from)",
-                        price, buy_price, prec = self.price_decimals as usize
-                    ),
-                );
-            }
+                ((price + self.spacing) * m).round() / m
+            };
+            self.sell_orders.insert(self.price_key(replenish), replenish);
+            crate::logger::log(
+                "[GRID]",
+                &format!(
+                    "Sell filled @ {:.prec$} — buy seeded at {:.prec$}, sell replenished at {:.prec$}",
+                    price, buy_price, replenish, prec = self.price_decimals as usize
+                ),
+            );
         }
     }
 

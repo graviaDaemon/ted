@@ -267,7 +267,7 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
             WsEvent::OrderNew { order_id }
         }
 
-        "oc" | "ou" => {
+        "oc" => {
             let order_id = arr
                 .get(2)
                 .and_then(|o| o.get(0))
@@ -282,6 +282,24 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
                 WsEvent::OrderFilled { order_id }
             } else {
                 WsEvent::OrderCancelled { order_id }
+            }
+        }
+
+        "ou" => {
+            let order_id = arr
+                .get(2)
+                .and_then(|o| o.get(0))
+                .and_then(|id| id.as_i64())
+                .unwrap_or(0);
+            let status = arr
+                .get(2)
+                .and_then(|o| o.get(13))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if status.starts_with("EXECUTED") {
+                WsEvent::OrderFilled { order_id }
+            } else {
+                WsEvent::Unknown
             }
         }
 
