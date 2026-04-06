@@ -49,6 +49,8 @@ pub struct RunnerState {
     pub runner_db_id: Option<i64>,
     pub db: Option<Db>,
     pub order_db_ids: HashMap<i64, i64>,
+    pub last_bid: f64,
+    pub last_ask: f64,
 }
 
 pub async fn run_runner(
@@ -208,6 +210,8 @@ pub async fn run_runner(
         runner_db_id: Some(runner_db_id),
         db: Some(db),
         order_db_ids: HashMap::new(),
+        last_bid: 0.0,
+        last_ask: 0.0,
     };
 
     crate::logger::log(&src, &format!("Runner started, algorithm: {}, mode: {}", algo_name, mode_label(&state.mode)));
@@ -297,7 +301,10 @@ pub async fn run_runner(
                 match auth_msg {
                     Some(Ok(Message::Text(text))) => {
                         let event = parse_auth_ws_message(&text);
-                        process_auth_event(&mut state, event);
+                        let fill_signals = process_auth_event(&mut state, event);
+                        if !fill_signals.is_empty() {
+                            dispatch_signals(&mut state, &fill_signals).await;
+                        }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Some(ref mut s) = auth_stream {
@@ -599,30 +606,14 @@ async fn throttle_order(last_order_time: &mut Option<Instant>, throttle_ms: u64)
     *last_order_time = Some(Instant::now());
 }
 
-async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
-    if state.paused {
-        return;
-    }
-
-    crate::logger::log(
-        &format!("RUNNER:{}", state.symbol),
-        &format!(
-            "[{}] last={:.2} bid={:.2} ask={:.2} vol={:.4}",
-            market_data.timestamp.format("%H:%M:%S"),
-            market_data.last_price, market_data.bid, market_data.ask, market_data.volume,
-        ),
-    );
-
-    let signals = state.algorithm.on_tick(&market_data);
-    let has_signals = !signals.is_empty();
-
-    for sig in &signals {
+async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal]) {
+    for sig in signals {
         let src = format!("RUNNER:{}", state.symbol);
         match sig {
             TradeSignal::Buy { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT BUY {:.8} @ {:.2} — {}", quantity, price, reason));
-                    state.algorithm.on_fill(*price, true);
+                    let _ = state.algorithm.on_fill(*price, true);
                     write_sim_order(state, "buy", *price, *quantity);
                 } else {
                     let (_, quote) = extract_currencies(&state.symbol);
@@ -637,8 +628,8 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                         crate::logger::log(&src, &format!("[{}] Buy at {:.2} already pending — skipping duplicate.", mode_label(&state.mode), price));
                         continue;
                     }
-                    if market_data.bid > 0.0 && market_data.ask > 0.0 && *price >= market_data.ask {
-                        crate::logger::log(&src, &format!("[{}] Buy at {:.2} would cross spread (ask={:.2}) — skipping.", mode_label(&state.mode), price, market_data.ask));
+                    if state.last_bid > 0.0 && state.last_ask > 0.0 && *price >= state.last_ask {
+                        crate::logger::log(&src, &format!("[{}] Buy at {:.2} would cross spread (ask={:.2}) — skipping.", mode_label(&state.mode), price, state.last_ask));
                         continue;
                     }
                     throttle_order(&mut state.last_order_time, state.config.startup_defaults.throttle_ms).await;
@@ -659,7 +650,7 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
             TradeSignal::Sell { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT SELL {:.8} @ {:.2} — {}", quantity, price, reason));
-                    state.algorithm.on_fill(*price, false);
+                    let _ = state.algorithm.on_fill(*price, false);
                     write_sim_order(state, "sell", *price, *quantity);
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);
@@ -674,8 +665,8 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
                         crate::logger::log(&src, &format!("[{}] Sell at {:.2} already pending — skipping duplicate.", mode_label(&state.mode), price));
                         continue;
                     }
-                    if market_data.bid > 0.0 && market_data.ask > 0.0 && *price <= market_data.bid {
-                        crate::logger::log(&src, &format!("[{}] Sell at {:.2} would cross spread (bid={:.2}) — skipping.", mode_label(&state.mode), price, market_data.bid));
+                    if state.last_bid > 0.0 && state.last_ask > 0.0 && *price <= state.last_bid {
+                        crate::logger::log(&src, &format!("[{}] Sell at {:.2} would cross spread (bid={:.2}) — skipping.", mode_label(&state.mode), price, state.last_bid));
                         continue;
                     }
                     throttle_order(&mut state.last_order_time, state.config.startup_defaults.throttle_ms).await;
@@ -695,6 +686,29 @@ async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
             }
         }
     }
+}
+
+async fn process_tick(state: &mut RunnerState, market_data: MarketData) {
+    if state.paused {
+        return;
+    }
+
+    state.last_bid = market_data.bid;
+    state.last_ask = market_data.ask;
+
+    crate::logger::log(
+        &format!("RUNNER:{}", state.symbol),
+        &format!(
+            "[{}] last={:.2} bid={:.2} ask={:.2} vol={:.4}",
+            market_data.timestamp.format("%H:%M:%S"),
+            market_data.last_price, market_data.bid, market_data.ask, market_data.volume,
+        ),
+    );
+
+    let signals = state.algorithm.on_tick(&market_data);
+    let has_signals = !signals.is_empty();
+
+    dispatch_signals(state, &signals).await;
 
     let entry = TradeEntry {
         timestamp: market_data.timestamp,
@@ -807,10 +821,13 @@ async fn sync_orders_after_reconnect(src: &str, symbol: &str, state: &mut Runner
                     state.pending_sell_orders.remove(&order_id);
                 }
                 state.live_order_ids.remove(&order_id);
-                state.algorithm.on_fill(price, is_buy);
+                let fill_signals = state.algorithm.on_fill(price, is_buy);
                 crate::logger::log(src, &format!("Reconnect sync: order {} filled @ {:.2}.", order_id, price));
                 write_fill_to_db(state, order_id, is_buy, price, qty);
                 state.order_db_ids.remove(&order_id);
+                if !fill_signals.is_empty() {
+                    dispatch_signals(state, &fill_signals).await;
+                }
             }
             Some(_) => {
                 if is_buy {
@@ -885,8 +902,9 @@ async fn reconnect_auth(
     false
 }
 
-fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
+fn process_auth_event(state: &mut RunnerState, event: WsEvent) -> Vec<TradeSignal> {
     let src = format!("RUNNER:{}", state.symbol);
+    let mut fill_signals: Vec<TradeSignal> = Vec::new();
     match event {
         WsEvent::AuthConfirmed => {
             crate::logger::log(&src, "Auth WS: authentication confirmed.");
@@ -913,7 +931,7 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
             for (id, price, qty) in &filled_buys {
                 state.live_order_ids.remove(id);
                 state.pending_buy_orders.remove(id);
-                state.algorithm.on_fill(*price, true);
+                fill_signals.extend(state.algorithm.on_fill(*price, true));
                 crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
                 write_fill_to_db(state, *id, true, *price, *qty);
                 state.order_db_ids.remove(id);
@@ -921,7 +939,7 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
             for (id, price, qty) in &filled_sells {
                 state.live_order_ids.remove(id);
                 state.pending_sell_orders.remove(id);
-                state.algorithm.on_fill(*price, false);
+                fill_signals.extend(state.algorithm.on_fill(*price, false));
                 crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
                 write_fill_to_db(state, *id, false, *price, *qty);
                 state.order_db_ids.remove(id);
@@ -938,12 +956,12 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
         WsEvent::OrderFilled { order_id } => {
             state.live_order_ids.remove(&order_id);
             if let Some((price, qty)) = state.pending_buy_orders.remove(&order_id) {
-                state.algorithm.on_fill(price, true);
+                fill_signals.extend(state.algorithm.on_fill(price, true));
                 crate::logger::log(&src, &format!("Buy order {} filled @ {:.2}.", order_id, price));
                 write_fill_to_db(state, order_id, true, price, qty);
                 state.order_db_ids.remove(&order_id);
             } else if let Some((price, qty)) = state.pending_sell_orders.remove(&order_id) {
-                state.algorithm.on_fill(price, false);
+                fill_signals.extend(state.algorithm.on_fill(price, false));
                 crate::logger::log(&src, &format!("Sell order {} filled @ {:.2}.", order_id, price));
                 write_fill_to_db(state, order_id, false, price, qty);
                 state.order_db_ids.remove(&order_id);
@@ -993,6 +1011,7 @@ fn process_auth_event(state: &mut RunnerState, event: WsEvent) {
         WsEvent::Heartbeat => {}
         _ => {}
     }
+    fill_signals
 }
 
 fn extract_currencies(symbol: &str) -> (String, String) {

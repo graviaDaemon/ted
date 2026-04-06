@@ -33,12 +33,14 @@ impl TradeLog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn last_24h(&self) -> &[TradeEntry] {
         let cutoff = Utc::now() - TimeDelta::hours(24);
         let start = self.entries.partition_point(|e| e.timestamp < cutoff);
         &self.entries[start..]
     }
 
+    #[allow(dead_code)]
     pub fn signal_entries(&self) -> Vec<&TradeEntry> {
         self.entries.iter().filter(|e| !e.signals.is_empty()).collect()
     }

@@ -8,7 +8,6 @@ pub struct GridBot {
     spacing: f64,
     price_decimals: u32,
     spread_ratio: f64,
-    pending_spacing: Option<f64>,
 
     buy_orders: HashMap<u64, f64>,
     sell_orders: HashMap<u64, f64>,
@@ -83,7 +82,6 @@ impl GridBot {
             spacing,
             price_decimals,
             spread_ratio,
-            pending_spacing: None,
             buy_orders: HashMap::new(),
             sell_orders: HashMap::new(),
             base_balance,
@@ -115,12 +113,6 @@ impl GridBot {
     }
 
     fn build_grid(&mut self, midpoint: f64) -> Vec<TradeSignal> {
-        if let Some(pending) = self.pending_spacing.take() {
-            self.spacing = pending;
-            let price_decimals = Self::decimals_from_price(midpoint).max(self.price_decimals);
-            self.price_decimals = price_decimals;
-        }
-
         let price_min = Self::decimals_from_price(midpoint);
         if self.price_decimals < price_min {
             self.price_decimals = price_min;
@@ -317,65 +309,67 @@ impl Algorithm for GridBot {
         signals
     }
 
-    fn on_fill(&mut self, price: f64, is_buy: bool) {
+    fn on_fill(&mut self, price: f64, is_buy: bool) -> Vec<TradeSignal> {
         let m = 10_f64.powi(self.price_decimals as i32);
+        let prec = self.price_decimals as usize;
 
         if is_buy {
             self.buy_orders.remove(&self.price_key(price));
             self.position += self.qty;
             self.total_buys += 1;
 
-            let sell_price = ((price + self.spacing) * m).round() / m;
-            self.sell_orders
-                .insert(self.price_key(sell_price), sell_price);
-
-            let replenish = if let Some(min_buy) = self.buy_orders.values().copied().reduce(f64::min) {
-                ((min_buy - self.spacing) * m).round() / m
-            } else {
-                ((price - self.spacing) * m).round() / m
-            };
-            if replenish > 0.0 {
-                self.buy_orders.insert(self.price_key(replenish), replenish);
-                crate::logger::log(
-                    "[GRID]",
-                    &format!(
-                        "Buy filled @ {:.prec$} — sell seeded at {:.prec$}, buy replenished at {:.prec$}",
-                        price, sell_price, replenish, prec = self.price_decimals as usize
-                    ),
-                );
-            } else {
-                crate::logger::log(
-                    "[GRID]",
-                    &format!(
-                        "Buy filled @ {:.prec$} — sell seeded at {:.prec$} (replenish skipped: price would go <= 0)",
-                        price, sell_price, prec = self.price_decimals as usize
-                    ),
-                );
-            }
+            let counter = ((price + self.spacing) * m).round() / m;
+            self.sell_orders.insert(self.price_key(counter), counter);
+            crate::logger::log(
+                "[GRID]",
+                &format!(
+                    "Buy filled @ {:.prec$} — counter sell at {:.prec$}",
+                    price,
+                    counter,
+                    prec = prec
+                ),
+            );
+            vec![TradeSignal::Sell {
+                price: counter,
+                quantity: self.qty,
+                reason: format!("Grid counter sell at {:.prec$}", counter, prec = prec),
+                price_decimals: self.price_decimals,
+            }]
         } else {
             self.sell_orders.remove(&self.price_key(price));
             self.position -= self.qty;
             self.total_sells += 1;
             self.realized_pnl += self.spacing * self.qty;
 
-            let buy_price = ((price - self.spacing) * m).round() / m;
-            if buy_price > 0.0 {
-                self.buy_orders.insert(self.price_key(buy_price), buy_price);
-            }
-
-            let replenish = if let Some(max_sell) = self.sell_orders.values().copied().reduce(f64::max) {
-                ((max_sell + self.spacing) * m).round() / m
+            let counter = ((price - self.spacing) * m).round() / m;
+            if counter > 0.0 {
+                self.buy_orders.insert(self.price_key(counter), counter);
+                crate::logger::log(
+                    "[GRID]",
+                    &format!(
+                        "Sell filled @ {:.prec$} — counter buy at {:.prec$}",
+                        price,
+                        counter,
+                        prec = prec
+                    ),
+                );
+                vec![TradeSignal::Buy {
+                    price: counter,
+                    quantity: self.qty,
+                    reason: format!("Grid counter buy at {:.prec$}", counter, prec = prec),
+                    price_decimals: self.price_decimals,
+                }]
             } else {
-                ((price + self.spacing) * m).round() / m
-            };
-            self.sell_orders.insert(self.price_key(replenish), replenish);
-            crate::logger::log(
-                "[GRID]",
-                &format!(
-                    "Sell filled @ {:.prec$} — buy seeded at {:.prec$}, sell replenished at {:.prec$}",
-                    price, buy_price, replenish, prec = self.price_decimals as usize
-                ),
-            );
+                crate::logger::log(
+                    "[GRID]",
+                    &format!(
+                        "Sell filled @ {:.prec$} — counter buy skipped (price would be <= 0)",
+                        price,
+                        prec = prec
+                    ),
+                );
+                vec![]
+            }
         }
     }
 
@@ -385,14 +379,8 @@ impl Algorithm for GridBot {
     }
 
     fn on_spacing_update(&mut self, new_spacing: f64) {
-        self.pending_spacing = Some(new_spacing);
-        crate::logger::log(
-            "[GRID]",
-            &format!(
-                "Spacing update queued: {:.8} (applied on next grid rebuild)",
-                new_spacing
-            ),
-        );
+        self.spacing = new_spacing;
+        crate::logger::log("[GRID]", &format!("Spacing updated: {:.8}", new_spacing));
     }
 
     fn on_reconnect(&mut self) {
@@ -419,7 +407,6 @@ impl Algorithm for GridBot {
         self.buy_orders.clear();
         self.sell_orders.clear();
         self.last_price = None;
-        self.pending_spacing = None;
         crate::logger::log(
             "[GRID]",
             "Live enabled — grid reset, will rebuild on next tick.",

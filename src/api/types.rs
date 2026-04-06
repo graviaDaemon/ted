@@ -26,6 +26,7 @@ pub enum TradeSignal {
 pub struct OrderResult {
     pub order_id: i64,
     pub status: String,
+    #[allow(dead_code)]
     pub text: String,
 }
 
