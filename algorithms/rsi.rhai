@@ -74,7 +74,7 @@ fn on_tick(price, bid, ask, volume) {
     last_rsi = r;
 
     if r < oversold {
-        return # {
+        return #{
             kind: "buy",
             price: price,
             qty: qty,
@@ -82,7 +82,7 @@ fn on_tick(price, bid, ask, volume) {
         };
     }
     if r > overbought {
-        return # {
+        return #{
             kind: "sell",
             price: price,
             qty: qty,

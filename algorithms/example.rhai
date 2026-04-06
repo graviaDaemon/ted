@@ -34,7 +34,7 @@ fn on_tick(price, bid, ask, volume) {
     let avg = prices.reduce(|a, b| a + b, 0.0) / prices.len();
 
     if price < avg * (1.0 - threshold) {
-        return # {
+        return #{
             kind: "buy",
             price: price,
             qty: qty,
@@ -42,7 +42,7 @@ fn on_tick(price, bid, ask, volume) {
         };
     }
     if price > avg * (1.0 + threshold) {
-        return # {
+        return #{
             kind: "sell",
             price: price,
             qty: qty,

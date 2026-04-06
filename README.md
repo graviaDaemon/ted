@@ -1,11 +1,12 @@
 # T.E.D — Trading Exchange Driver
----
-
-DISCLAIMER: AI has been used as a tool to fix some bugs, and streamline some of the data-flow.
-As well as writing parts of this README.md
 
 ---
-![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-1.0.3-green)
+
+DISCLAIMER: AI has been used as a tool to fix some bugs, streamline data-flow, and write parts of this README.
+
+---
+
+![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-2.0.0-green)
 
 A Rust-based algorithmic trading daemon for the Bitfinex exchange. Connects to the Bitfinex WebSocket v2 API, streams live market data, and executes configurable trading strategies.
 
@@ -14,28 +15,60 @@ A Rust-based algorithmic trading daemon for the Bitfinex exchange. Connects to t
 ## Prerequisites
 
 - Rust toolchain (stable, 2024 edition)
-- A crypto-platform account with API credentials
+- A Bitfinex account with API credentials
 - `config.json` in the working directory (see below)
-
-If you have a cleaner, or maybe more dynamic means of adjusting the config.json, please make a Pull Request or fork
 
 ---
 
 ## Configuration
 
-Create `config.json` next to the executable:
+Copy `config.template.json` to `config.json` and fill in your credentials:
 
 ```json
 {
-  "auth_endpoint": "https://api.example.com/",
-  "pub_endpoint":  "https://api-pub.example.com/v2/",
-  "ws_endpoint":   "wss://api-pub.example.com/ws/2",
-  "key":    "YOUR_API_KEY",
-  "secret": "YOUR_API_SECRET"
+  "api": {
+    "auth_endpoint":    "https://api.bitfinex.com",
+    "pub_endpoint":     "https://api-pub.bitfinex.com",
+    "ws_endpoint":      "wss://api-pub.bitfinex.com/ws/2",
+    "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2"
+  },
+  "credentials": {
+    "live_key":    "YOUR_LIVE_API_KEY",
+    "live_secret": "YOUR_LIVE_API_SECRET",
+    "paper_key":   "YOUR_PAPER_API_KEY",
+    "paper_secret": "YOUR_PAPER_API_SECRET"
+  },
+  "startup_defaults": {
+    "paper":            false,
+    "throttle_ms":      300,
+    "log_retention":    7,
+    "atr_refresh_mins": 60
+  }
 }
 ```
 
-The key and secret are only used when live trading is enabled. Dry-run mode (the default) never touches the exchange REST API.
+| Field | Description |
+|-------|-------------|
+| `api.auth_endpoint` | Base URL for authenticated REST calls |
+| `api.pub_endpoint` | Base URL for public REST calls (candle fetches) |
+| `api.ws_endpoint` | Public WebSocket endpoint (ticker streaming) |
+| `api.auth_ws_endpoint` | Authenticated WebSocket endpoint (order events) |
+| `credentials.live_key/secret` | API key and secret for your live Bitfinex account |
+| `credentials.paper_key/secret` | API key and secret for your Bitfinex paper trading sub-account |
+| `startup_defaults.paper` | Start runners in paper mode by default (`true`/`false`) |
+| `startup_defaults.throttle_ms` | Minimum milliseconds between ticks processed |
+| `startup_defaults.log_retention` | Days of log files to keep |
+| `startup_defaults.atr_refresh_mins` | How often (in minutes) to refetch ATR for dynamic grid spacing |
+
+### Setting up paper trading credentials
+
+1. Log into your Bitfinex account
+2. Go to **Account → Paper Trading** and enable the paper trading sub-account
+3. Generate an API key specifically for the paper account (separate from your live key/secret)
+4. Fill `credentials.paper_key` and `credentials.paper_secret` with those values
+5. Set `startup_defaults.paper: true` to start runners in paper mode by default, or pass `--paper` at runtime
+
+Paper mode uses the same Bitfinex endpoints as live trading — only the credentials differ. If paper credentials are absent, the runner refuses to start rather than silently falling back to simulation.
 
 ---
 
@@ -46,15 +79,13 @@ cargo build --release
 ./target/release/ted
 ```
 
-The binary enters an interactive terminal session. Log output scrolls above the input line; the `> ` prompt stays pinned at the bottom. Use `Ctrl+C` or `Ctrl+D` or type `exit` to quit gracefully.
-
-A log file `ted.log` is written in the working directory alongside all terminal output.
+The binary enters an interactive terminal session. Log output scrolls above the input line; the `> ` prompt stays pinned at the bottom. Use `Ctrl+C`, `Ctrl+D`, or type `exit` to quit gracefully.
 
 ---
 
 ## Commands
 
-All commands are typed at the `> ` prompt and dispatched on Enter. Commands follow standard CLI syntax — flags can be combined freely.
+All commands are typed at the `> ` prompt and dispatched on Enter.
 
 ### `runner` — manage trading runners
 
@@ -63,35 +94,41 @@ Each runner is an independent async task that streams market data for one symbol
 **Spawn a new runner:**
 ```
 runner --symbol BTCUSD
-runner --symbol BTCUSD --algorithm grid --option spacing=500 qty=0.001
+runner --symbol BTCUSD --algorithm grid --option levels=5 qty=0.001 atr_period=14
 runner --symbol ETHUSD --algorithm example --option period=30 qty=0.01
+runner --symbol LTCUSD --algorithm grid --option levels=5 qty=0.1 atr_period=14 --paper
 ```
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--symbol <SYM>` | `-s` | Trading pair symbol (required) |
 | `--algorithm <NAME>` | `-a` | Algorithm name: `passive`, `grid`, or any script name (default: `passive`) |
-| `--option <KEY=VALUE>` | | Algorithm options, repeat for multiple |
+| `--option <KEY=VALUE>` | | Algorithm options; repeat for multiple |
+| `--paper` | | Start this runner in paper mode (overrides `startup_defaults.paper`) |
 
 **Lifecycle:**
 ```
 runner -s BTCUSD --pause          # pause tick processing (WS stays connected)
 runner -s BTCUSD --resume         # resume
-runner -s BTCUSD --kill           # stop runner, cancel any open live orders
+runner -s BTCUSD --kill           # stop runner and cancel any open orders
 ```
 
 **Switch algorithm on a running runner:**
 ```
-runner -s BTCUSD --configure grid --option spacing=250 qty=0.002
+runner -s BTCUSD --configure grid --option levels=5 qty=0.002 atr_period=14
 ```
 
-**Enable/disable live trading:**
+**Switch trading mode:**
 ```
-runner -s BTCUSD --enable-live    # real orders will be placed
-runner -s BTCUSD --disable-live   # back to dry-run
+runner -s BTCUSD --set-mode simulation   # log-only, no API calls
+runner -s BTCUSD --set-mode paper        # orders against paper account
+runner -s BTCUSD --set-mode live         # real orders on live account
 ```
 
-Live trading is **disabled by default**. In dry-run mode all signals are logged as `[DRY RUN]` and no orders are placed.
+There are three modes:
+- **simulation** — no API calls; fills are simulated immediately on signal. The default when paper credentials are absent or `startup_defaults.paper` is `false`.
+- **paper** — places and tracks real orders against the Bitfinex paper trading account using paper credentials.
+- **live** — places and tracks real orders against the live account.
 
 ---
 
@@ -101,12 +138,12 @@ Writes a Markdown report of a runner's activity to disk.
 
 ```
 generate --runner BTCUSD           # single runner
-generate --runner BTCUSD --verbose # include full signal table
+generate --runner BTCUSD --verbose # include full signal table and PnL breakdown
 generate --all                     # all running runners, combined file
 generate --all --verbose
 ```
 
-Output files are written to the current directory with timestamped names (`overview_BTCUSD_2026-03-22.md`, `overview_all_2026-03-22.md`).
+Output files are written to the current directory (`overview_BTCUSD_2026-03-22.md`, `overview_all_2026-03-22.md`).
 
 ---
 
@@ -116,7 +153,7 @@ Output files are written to the current directory with timestamped names (`overv
 exit
 ```
 
-Gracefully stops all runners (cancels open live orders), closes WebSocket connections, and exits.
+Gracefully stops all runners (cancels open orders), closes WebSocket connections, and exits.
 
 ---
 
@@ -132,21 +169,26 @@ runner -s BTCUSD --algorithm passive
 
 ### Built-in: `grid`
 
-Places limit buy and sell orders at equidistant price levels. The grid is centred on the live price at the moment the first tick arrives, so no manual range configuration is needed.
+Places limit buy and sell orders at equidistant price levels. The grid is centred on the live price at the moment the first tick arrives. In paper/live mode, the initial grid size is constrained by available wallet balance.
+
+**Dynamic spacing via ATR**: when `atr_period` is supplied, spacing is derived from the Average True Range of recent candles (`spacing = ATR × atr_multiplier`). This makes the grid adapt to current market volatility. ATR is refreshed periodically based on `startup_defaults.atr_refresh_mins`.
 
 | Option | Description | Required |
 |--------|-------------|----------|
-| `spacing=<float>` | Distance between grid levels in quote currency | Yes |
 | `qty=<float>` | Order quantity per level in base currency | Yes |
-| `levels=<int>` | Total number of grid intervals (minimum 2) | Yes |
-| `initial_base=<float>` | Existing base asset to seed initial sell orders | No |
+| `levels=<int>` | Number of grid levels per side (minimum 1) | Yes |
+| `spacing=<float>` | Fixed distance between levels in quote currency | Required if no ATR options |
+| `atr_period=<int>` | ATR period in candles (enables dynamic spacing) | No |
+| `atr_timeframe=<str>` | Candle timeframe for ATR (`1h`, `4h`, `1D`, etc.; default: `1h`) | No |
+| `atr_multiplier=<float>` | Multiplier applied to ATR to get spacing (default: `1.0`) | No |
+| `spread_ratio=<float>` | Fraction of spacing to offset buys below and sells above midpoint (default: `0.0`) | No |
 
 ```
-runner -s BTCUSD --algorithm grid --option spacing=500 qty=0.001 levels=10
-runner -s BTCUSD --algorithm grid --option spacing=200 qty=0.005 levels=6 initial_base=0.1
+runner -s BTCUSD --algorithm grid --option levels=5 qty=0.001 spacing=500
+runner -s BTCUSD --algorithm grid --option levels=5 qty=0.001 atr_period=14 atr_timeframe=4h atr_multiplier=1.5
 ```
 
-With `levels=10` and `spacing=500` the grid spans 5000 units of quote currency, centred on the first price seen. Without `initial_base` the bot buys first; each filled buy places a sell one level above, and vice versa.
+With `levels=5` and `spacing=500` the grid places 5 buy levels below and 5 sell levels above the midpoint, 500 quote units apart. Each fill seeds the opposite side and replenishes the same side at the extremity.
 
 ---
 
@@ -244,10 +286,26 @@ Log lines scroll above the prompt; the input line is always preserved at the bot
 
 ## File layout
 
+Data and logs are written to the platform data directory, not the working directory.
+
+| Platform | Path |
+|----------|------|
+| Windows | `%LOCALAPPDATA%\ted\` |
+| macOS | `~/Library/Application Support/ted/` |
+| Linux | `~/.local/share/ted/` |
+
 ```
-ted/
+<data dir>/ted/
+├── ted.db               # SQLite database (runners, ticks, orders, fills)
+├── logs/
+│   ├── ted.log          # current log file
+│   └── ted_2026-03-22.log  # rotated logs (kept for log_retention days)
+└── trades/
+    └── trades_BTCUSD.jsonl  # per-symbol trade log (legacy, kept for compatibility)
+
+<working dir>/
 ├── config.json          # API credentials and endpoints
-├── ted.log              # append-only log file
+├── config.template.json # template — copy and fill in
 ├── algorithms/          # drop .rhai strategy scripts here
 │   └── example.rhai     # reference SMA implementation
 └── overview_*.md        # generated reports

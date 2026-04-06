@@ -9,6 +9,8 @@ pub trait Algorithm: Send {
     fn on_fill(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
     fn on_live_enabled(&mut self) {}
+    fn on_spacing_update(&mut self, _new_spacing: f64) {}
+    fn on_balance_update(&mut self, _base: f64, _quote: f64) {}
     fn summary(&self) -> Option<String> {
         None
     }

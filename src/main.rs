@@ -8,9 +8,8 @@ mod logger;
 mod tui;
 
 use crate::config::config::Config;
-use crate::config::channels::RunnerControl;
+use crate::config::channels::{RunnerControl, RunnerMode};
 use crate::commands::cli::{Cli, CliAction};
-use crate::algorithm::traits::build_algorithm;
 use std::collections::HashMap;
 use std::time::Duration;
 use clap::Parser;
@@ -32,7 +31,8 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if let Err(e) = logger::init(log_tx, config.retention) {
+    crate::storage::data_dir();
+    if let Err(e) = logger::init(log_tx, config.startup_defaults.log_retention) {
         eprintln!("Warning: could not initialise log file: {}", e);
     }
 
@@ -106,11 +106,11 @@ async fn main() {
 }
 
 fn validate_config(c: &Config) -> Result<(), String> {
-    if c.key.is_empty()              { return Err("'key' is empty".into()); }
-    if c.secret.is_empty()           { return Err("'secret' is empty".into()); }
-    if c.ws_endpoint.is_empty()      { return Err("'ws_endpoint' is empty".into()); }
-    if c.auth_ws_endpoint.is_empty() { return Err("'auth_ws_endpoint' is empty".into()); }
-    if c.auth_endpoint.is_empty()    { return Err("'auth_endpoint' is empty".into()); }
+    if c.credentials.live_key.is_empty()       { return Err("credentials.live_key is empty".into()); }
+    if c.credentials.live_secret.is_empty()    { return Err("credentials.live_secret is empty".into()); }
+    if c.api.ws_endpoint.is_empty()            { return Err("api.ws_endpoint is empty".into()); }
+    if c.api.auth_ws_endpoint.is_empty()       { return Err("api.auth_ws_endpoint is empty".into()); }
+    if c.api.auth_endpoint.is_empty()          { return Err("api.auth_endpoint is empty".into()); }
     Ok(())
 }
 
@@ -172,30 +172,27 @@ async fn dispatch(
     config: &Config,
 ) {
     match action {
-        CliAction::Spawn { symbol, algorithm, options } => {
+        CliAction::Spawn { symbol, algorithm, options, paper } => {
             if runner_txs.contains_key(&symbol) {
                 logger::log("[CTRL]", &format!("Runner for '{}' is already running.", symbol));
                 return;
             }
-            let algo = match build_algorithm(&algorithm, &options) {
-                Ok(a) => a,
-                Err(e) => {
-                    logger::log(
-                        "[CTRL]",
-                        &format!("Failed to build algorithm '{}': {}", algorithm, e),
-                    );
-                    return;
-                }
+            let mode = if paper || config.startup_defaults.paper {
+                RunnerMode::Paper
+            } else {
+                RunnerMode::Simulation
             };
             let (tx, rx) = channel::<RunnerControl>(64);
             let sym = symbol.clone();
+            let algo = algorithm.clone();
             let cfg = config.clone();
+            let mode_label = format!("{:?}", mode).to_lowercase();
             let handle = tokio::spawn(async move {
-                crate::runner::run_runner(sym, algo, rx, cfg).await;
+                crate::runner::run_runner(sym, algo, options, mode, rx, cfg).await;
             });
             runner_txs.insert(symbol.clone(), tx);
             runner_handles.insert(symbol.clone(), handle);
-            logger::log("[CTRL]", &format!("Spawned runner for '{}' (mode: dry-run).", symbol));
+            logger::log("[CTRL]", &format!("Spawned runner for '{}' (mode: {}).", symbol, mode_label));
         }
 
         CliAction::Pause { symbol } => {
@@ -223,12 +220,8 @@ async fn dispatch(
             .await;
         }
 
-        CliAction::EnableLive { symbol } => {
-            send_control(runner_txs, &symbol, RunnerControl::EnableLive).await;
-        }
-
-        CliAction::DisableLive { symbol } => {
-            send_control(runner_txs, &symbol, RunnerControl::DisableLive).await;
+        CliAction::SetMode { symbol, mode } => {
+            send_control(runner_txs, &symbol, RunnerControl::SetMode(mode)).await;
         }
 
         CliAction::Generate { symbol, all, verbose } => {

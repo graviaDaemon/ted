@@ -15,7 +15,7 @@ pub async fn connect_and_subscribe(
     symbol: &str,
     config: &Config,
 ) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, u64), Box<dyn Error>> {
-    let (mut ws_stream, _) = connect_async(config.ws_endpoint.as_str()).await?;
+    let (mut ws_stream, _) = connect_async(config.api.ws_endpoint.as_str()).await?;
     
     loop {
         let msg = ws_stream
@@ -154,8 +154,9 @@ pub fn parse_ws_message(msg: &str, chan_map: &HashMap<u64, String>) -> WsEvent {
 
 pub async fn connect_authenticated(
     config: &Config,
+    paper: bool,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn Error>> {
-    let (mut ws, _) = connect_async(config.auth_ws_endpoint.as_str()).await?;
+    let (mut ws, _) = connect_async(config.api.auth_ws_endpoint.as_str()).await?;
     
     let info_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -177,10 +178,10 @@ pub async fn connect_authenticated(
     }
     
     let nonce = Utc::now().timestamp_millis().to_string();
-    let sig   = sign_auth_payload(&config.secret, &nonce);
+    let sig   = sign_auth_payload(config.effective_secret(paper), &nonce);
     let auth_msg = json!({
         "event":       "auth",
-        "apiKey":      config.key,
+        "apiKey":      config.effective_key(paper),
         "authSig":     sig,
         "authNonce":   nonce,
         "authPayload": format!("AUTH{}", nonce),
@@ -294,7 +295,10 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
                         .filter_map(|e| {
                             let wallet_type = e.get(0)?.as_str()?.to_string();
                             let currency    = e.get(1)?.as_str()?.to_string();
-                            let available   = e.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let available   = e.get(4)
+                                .and_then(|v| v.as_f64())
+                                .or_else(|| e.get(2).and_then(|v| v.as_f64()))
+                                .unwrap_or(0.0);
                             Some((wallet_type, currency, available))
                         })
                         .collect()
@@ -318,6 +322,7 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
             let available = entry
                 .and_then(|e| e.get(4))
                 .and_then(|v| v.as_f64())
+                .or_else(|| entry.and_then(|e| e.get(2)).and_then(|v| v.as_f64()))
                 .unwrap_or(0.0);
             WsEvent::WalletUpdate { wallet_type, currency, available }
         }

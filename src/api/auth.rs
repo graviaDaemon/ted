@@ -1,3 +1,4 @@
+use hmac::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha384;
 

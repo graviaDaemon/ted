@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use crate::config::channels::RunnerMode;
 use clap::{Args, Parser, Subcommand};
+use std::collections::HashMap;
+
 #[derive(Parser, Debug)]
 #[command(name = "ted")]
 pub struct Cli {
@@ -24,38 +26,52 @@ impl Cli {
                     return Ok(CliAction::Resume { symbol });
                 }
                 if let Some(alg) = &run.configure {
-                    return Ok(CliAction::Configure { symbol, algorithm: alg.clone(), options });
+                    return Ok(CliAction::Configure {
+                        symbol,
+                        algorithm: alg.clone(),
+                        options,
+                    });
                 }
-                if run.enable_live {
-                    return Ok(CliAction::EnableLive { symbol });
-                }
-                if run.disable_live {
-                    return Ok(CliAction::DisableLive { symbol });
+                if let Some(mode_str) = &run.set_mode {
+                    let mode = parse_mode(mode_str)?;
+                    return Ok(CliAction::SetMode { symbol, mode });
                 }
 
-                // Default: no lifecycle flag set — spawn a new runner
                 Ok(CliAction::Spawn {
                     symbol,
                     algorithm: run.algorithm.clone().unwrap_or_default(),
                     options,
+                    paper: run.paper,
                 })
             }
-            RunCommand::Generate(generate) => {
-                Ok(CliAction::Generate {
-                    symbol: generate.runner.clone(),
-                    all: generate.all,
-                    verbose: generate.verbose,
-                })
-            }
+            RunCommand::Generate(generate) => Ok(CliAction::Generate {
+                symbol: generate.runner.clone(),
+                all: generate.all,
+                verbose: generate.verbose,
+            }),
             RunCommand::Exit => Ok(CliAction::Exit),
         }
+    }
+}
+
+fn parse_mode(s: &str) -> Result<RunnerMode, Box<dyn std::error::Error>> {
+    match s.to_ascii_lowercase().as_str() {
+        "simulation" => Ok(RunnerMode::Simulation),
+        "paper" => Ok(RunnerMode::Paper),
+        "live" => Ok(RunnerMode::Live),
+        other => Err(format!(
+            "Unknown mode '{}': expected simulation, paper, or live",
+            other
+        )
+        .into()),
     }
 }
 
 fn parse_options(raw: &[String]) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let mut map = HashMap::new();
     for entry in raw {
-        let (k, v) = entry.split_once('=')
+        let (k, v) = entry
+            .split_once('=')
             .ok_or_else(|| format!("Invalid option '{}': expected key=value format", entry))?;
         map.insert(k.to_string(), v.to_string());
     }
@@ -66,7 +82,7 @@ fn parse_options(raw: &[String]) -> Result<HashMap<String, String>, Box<dyn std:
 pub enum RunCommand {
     Runner(RunnerCommand),
     Generate(GenerateCommand),
-    Exit
+    Exit,
 }
 
 #[derive(Args, Debug)]
@@ -78,7 +94,7 @@ pub struct RunnerCommand {
     pub algorithm: Option<String>,
 
     #[arg(long, short = 'o', value_name = "KEY=VALUE", num_args = 0..)]
-    pub  option: Vec<String>,
+    pub option: Vec<String>,
 
     #[arg(short = 'p', long, conflicts_with = "resume")]
     pub pause: bool,
@@ -86,39 +102,60 @@ pub struct RunnerCommand {
     #[arg(short = 'r', long, conflicts_with = "pause")]
     pub resume: bool,
 
-    #[arg(short = 'k', long, conflicts_with_all(["pause","resume"]) )]
+    #[arg(short = 'k', long, conflicts_with_all(["pause", "resume"]))]
     pub kill: bool,
 
     #[arg(short = 'c', long, value_name = "ALGORITHM")]
     pub configure: Option<String>,
 
-    #[arg(short = 'l', long, conflicts_with = "disable_live")]
-    pub enable_live: bool,
+    #[arg(long, short = 'm', value_name = "simulation|paper|live")]
+    pub set_mode: Option<String>,
 
-    #[arg(short = 'd', long, conflicts_with = "enable_live")]
-    pub disable_live: bool,
+    #[arg(long)]
+    pub paper: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct GenerateCommand {
     #[arg(short = 'r', long, value_name = "SYMBOL", conflicts_with = "all")]
-    pub runner: Option<String>,   // generate for a specific runner
+    pub runner: Option<String>,
 
     #[arg(short = 'a', long, conflicts_with = "runner")]
-    pub all: bool,                // generate for all running runners
+    pub all: bool,
 
     #[arg(short = 'v', long)]
     pub verbose: bool,
 }
 
 pub enum CliAction {
-    Spawn    { symbol: String, algorithm: String, options: HashMap<String, String> },
-    Pause    { symbol: String },
-    Resume   { symbol: String },
-    Kill     { symbol: String },
-    Configure { symbol: String, algorithm: String, options: HashMap<String, String> },
-    EnableLive  { symbol: String },
-    DisableLive { symbol: String },
-    Generate { symbol: Option<String>, all: bool, verbose: bool },
+    Spawn {
+        symbol: String,
+        algorithm: String,
+        options: HashMap<String, String>,
+        paper: bool,
+    },
+    Pause {
+        symbol: String,
+    },
+    Resume {
+        symbol: String,
+    },
+    Kill {
+        symbol: String,
+    },
+    Configure {
+        symbol: String,
+        algorithm: String,
+        options: HashMap<String, String>,
+    },
+    SetMode {
+        symbol: String,
+        mode: RunnerMode,
+    },
+    Generate {
+        symbol: Option<String>,
+        all: bool,
+        verbose: bool,
+    },
     Exit,
 }

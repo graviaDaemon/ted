@@ -13,19 +13,25 @@ struct LogState {
 static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 
+fn logs_dir() -> PathBuf {
+    crate::storage::data_dir().join("logs")
+}
+
 fn log_path_for(date: &str) -> PathBuf {
-    PathBuf::from(format!("logs/ted_{}.log", date))
+    logs_dir().join(format!("ted_{}.log", date))
 }
 
 fn archive_old_logs(retention: u32) {
     if retention == 0 {
         return;
     }
-    if let Err(e) = std::fs::create_dir_all("logs/archive") {
+    let logs = logs_dir();
+    let archive = logs.join("archive");
+    if let Err(e) = std::fs::create_dir_all(&archive) {
         eprintln!("[LOGGER] Failed to create logs/archive: {}", e);
         return;
     }
-    let entries = match std::fs::read_dir("logs") {
+    let entries = match std::fs::read_dir(&logs) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[LOGGER] Failed to read logs/: {}", e);
@@ -46,8 +52,8 @@ fn archive_old_logs(retention: u32) {
         if (today - parsed).num_days() <= retention as i64 {
             continue;
         }
-        let src = entry.path();
-        let dest = PathBuf::from(format!("logs/archive/{}", name));
+        let src  = entry.path();
+        let dest = archive.join(&name);
         if std::fs::rename(&src, &dest).is_err() {
             if std::fs::copy(&src, &dest).is_ok() {
                 let _ = std::fs::remove_file(&src);
@@ -59,7 +65,7 @@ fn archive_old_logs(retention: u32) {
 }
 
 pub fn init(tx: Sender<String>, retention: u32) -> io::Result<()> {
-    std::fs::create_dir_all("logs")?;
+    std::fs::create_dir_all(logs_dir())?;
     let today = Utc::now().format("%d-%m-%Y").to_string();
     let file = OpenOptions::new()
         .create(true)

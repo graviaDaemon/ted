@@ -1,11 +1,23 @@
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunnerMode {
+    Simulation,
+    Paper,
+    Live,
+}
+
 pub enum RunnerControl {
-    SetAlgorithm { name: String, options: HashMap<String, String> },
-    EnableLive,
-    DisableLive,
-    GenerateOverview { verbose: bool, reply: oneshot::Sender<String> },
+    SetAlgorithm {
+        name: String,
+        options: HashMap<String, String>,
+    },
+    SetMode(RunnerMode),
+    GenerateOverview {
+        verbose: bool,
+        reply: oneshot::Sender<String>,
+    },
     Pause,
     Resume,
     Kill,
