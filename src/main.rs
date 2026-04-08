@@ -220,10 +220,6 @@ async fn dispatch(
             .await;
         }
 
-        CliAction::SetMode { symbol, mode } => {
-            send_control(runner_txs, &symbol, RunnerControl::SetMode(mode)).await;
-        }
-
         CliAction::Generate { symbol, all, verbose } => {
             if all {
                 let symbols: Vec<String> = runner_txs.keys().cloned().collect();

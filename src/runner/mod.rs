@@ -1,25 +1,24 @@
-pub mod trade_log;
-pub mod report;
-pub mod state;
 pub mod dispatch;
 pub mod reconcile;
+pub mod report;
+pub mod state;
+pub mod trade_log;
 
+use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::time::{Duration};
-use chrono::Utc;
+use tokio::time::Duration;
 
 use crate::algorithm::build_algorithm;
 use crate::api::MarketData;
 use crate::config::channels::{RunnerControl, RunnerMode};
 use crate::config::config::Config;
-use crate::engine::{channels::EngineEvent, EngineHandle};
+use crate::engine::{EngineHandle, channels::EngineEvent};
 use crate::storage::db::Db;
 use crate::util::extract_currencies;
-use state::RunnerState;
 use dispatch::dispatch_signals;
+use state::RunnerState;
 use trade_log::{TradeEntry, TradeLog};
-
 
 pub(crate) fn mode_label(mode: &RunnerMode) -> &'static str {
     match mode {
@@ -37,7 +36,7 @@ fn should_fetch_atr(algo_name: &str, options: &HashMap<String, String>) -> bool 
 }
 
 async fn wait_for_wallet_event(
-    event_rx: &mut mpsc::Receiver<EngineEvent>,
+    event_rx: &mut Receiver<EngineEvent>,
     options: &mut HashMap<String, String>,
     symbol: &str,
 ) -> Result<(), String> {
@@ -52,21 +51,33 @@ async fn wait_for_wallet_event(
                             map.insert(currency, available);
                         }
                     }
-                    let base_bal  = map.get(&base).copied().unwrap_or(0.0);
+                    let base_bal = map.get(&base).copied().unwrap_or(0.0);
                     let quote_bal = map.get(&quote).copied().unwrap_or(0.0);
                     crate::logger::log(
                         &format!("RUNNER:{}", symbol),
-                        &format!("Wallet: {} {:.8}, {} {:.8}", base, base_bal, quote, quote_bal),
+                        &format!(
+                            "Wallet: {} {:.8}, {} {:.8}",
+                            base, base_bal, quote, quote_bal
+                        ),
                     );
-                    options.insert("initial_base_balance".to_string(), format!("{:.8}", base_bal));
-                    options.insert("initial_quote_balance".to_string(), format!("{:.8}", quote_bal));
+                    options.insert(
+                        "initial_base_balance".to_string(),
+                        format!("{:.8}", base_bal),
+                    );
+                    options.insert(
+                        "initial_quote_balance".to_string(),
+                        format!("{:.8}", quote_bal),
+                    );
                     return Ok(());
                 }
                 Some(_) => {}
-                None => return Err("Engine event channel closed before wallet snapshot".to_string()),
+                None => {
+                    return Err("Engine event channel closed before wallet snapshot".to_string());
+                }
             }
         }
-    }).await;
+    })
+    .await;
     result.map_err(|_| "Timed out waiting for wallet snapshot (30s)".to_string())?
 }
 
@@ -75,12 +86,17 @@ pub(crate) async fn cancel_all_live_orders(state: &mut RunnerState, engine: &Eng
         return;
     }
     let src = format!("RUNNER:{}", state.symbol);
-    crate::logger::log(&src, &format!("Cancelling {} open order(s)…", state.live_order_ids.len()));
+    crate::logger::log(
+        &src,
+        &format!("Cancelling {} open order(s)…", state.live_order_ids.len()),
+    );
     let ids: Vec<i64> = state.live_order_ids.iter().copied().collect();
     for order_id in ids {
         match engine.cancel_order(order_id).await {
             Ok(()) => crate::logger::log(&src, &format!("Cancelled order {}.", order_id)),
-            Err(e) => crate::logger::log(&src, &format!("Failed to cancel order {}: {}", order_id, e)),
+            Err(e) => {
+                crate::logger::log(&src, &format!("Failed to cancel order {}: {}", order_id, e))
+            }
         }
     }
     state.live_order_ids.clear();
@@ -109,10 +125,18 @@ pub async fn run_runner(
     };
 
     let started_at = Utc::now();
-    let runner_db_id = match db.insert_runner(&symbol, &algo_name, mode_label(&mode), &started_at.to_rfc3339()) {
+    let runner_db_id = match db.insert_runner(
+        &symbol,
+        &algo_name,
+        mode_label(&mode),
+        &started_at.to_rfc3339(),
+    ) {
         Ok(id) => id,
         Err(e) => {
-            crate::logger::log(&src, &format!("Failed to insert runner row: {} — runner exiting.", e));
+            crate::logger::log(
+                &src,
+                &format!("Failed to insert runner row: {} — runner exiting.", e),
+            );
             return;
         }
     };
@@ -124,45 +148,82 @@ pub async fn run_runner(
         match wait_for_wallet_event(&mut event_rx, &mut options, &symbol).await {
             Ok(()) => {}
             Err(e) => {
-                crate::logger::log(&src, &format!("Wallet snapshot failed: {} — runner exiting.", e));
+                crate::logger::log(
+                    &src,
+                    &format!("Wallet snapshot failed: {} — runner exiting.", e),
+                );
                 engine.unsubscribe(symbol.clone()).await;
                 return;
             }
         }
 
         if should_fetch_atr(&algo_name, &options) {
-            let timeframe = options.get("atr_timeframe").cloned().unwrap_or_else(|| "1h".to_string());
-            let period = options.get("atr_period").and_then(|v| v.parse::<usize>().ok()).unwrap_or(14);
-            let multiplier = options.get("atr_multiplier").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.5);
-            match engine.fetch_candles(symbol.clone(), timeframe.clone(), period).await {
+            let timeframe = options
+                .get("atr_timeframe")
+                .cloned()
+                .unwrap_or_else(|| "1h".to_string());
+            let period = options
+                .get("atr_period")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(14);
+            let multiplier = options
+                .get("atr_multiplier")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.5);
+            match engine
+                .fetch_candles(symbol.clone(), timeframe.clone(), period)
+                .await
+            {
                 Ok(candles) => match crate::algorithm::atr::compute_atr(&candles, period) {
                     Ok(atr) => {
                         let spacing = atr * multiplier;
-                        crate::logger::log(&src, &format!("ATR({}) on {} = {:.8}, ×{:.2} → spacing {:.8}", period, timeframe, atr, multiplier, spacing));
+                        crate::logger::log(
+                            &src,
+                            &format!(
+                                "ATR({}) on {} = {:.8}, ×{:.2} → spacing {:.8}",
+                                period, timeframe, atr, multiplier, spacing
+                            ),
+                        );
                         options.insert("spacing".to_string(), format!("{:.8}", spacing));
                     }
                     Err(e) => {
-                        crate::logger::log(&src, &format!("ATR computation failed: {} — runner exiting.", e));
+                        crate::logger::log(
+                            &src,
+                            &format!("ATR computation failed: {} — runner exiting.", e),
+                        );
                         engine.unsubscribe(symbol.clone()).await;
                         return;
                     }
                 },
                 Err(e) => {
-                    crate::logger::log(&src, &format!("Candle fetch failed: {} — runner exiting.", e));
+                    crate::logger::log(
+                        &src,
+                        &format!("Candle fetch failed: {} — runner exiting.", e),
+                    );
                     engine.unsubscribe(symbol.clone()).await;
                     return;
                 }
             }
         }
     } else {
-        options.entry("initial_base_balance".to_string()).or_insert_with(|| "0.0".to_string());
-        options.entry("initial_quote_balance".to_string()).or_insert_with(|| "1000000.0".to_string());
+        options
+            .entry("initial_base_balance".to_string())
+            .or_insert_with(|| "0.0".to_string());
+        options
+            .entry("initial_quote_balance".to_string())
+            .or_insert_with(|| "1000000.0".to_string());
     }
 
     let algorithm = match build_algorithm(&algo_name, &options) {
         Ok(a) => a,
         Err(e) => {
-            crate::logger::log(&src, &format!("Failed to build algorithm '{}': {} — runner exiting.", algo_name, e));
+            crate::logger::log(
+                &src,
+                &format!(
+                    "Failed to build algorithm '{}': {} — runner exiting.",
+                    algo_name, e
+                ),
+            );
             engine.unsubscribe(symbol.clone()).await;
             return;
         }
@@ -170,17 +231,21 @@ pub async fn run_runner(
 
     let (base_check, quote_check) = extract_currencies(&symbol);
     if base_check.is_empty() || quote_check.is_empty() {
-        crate::logger::log(&src, "Warning: symbol format unrecognised — wallet balance checks will be unavailable.");
+        crate::logger::log(
+            &src,
+            "Warning: symbol format unrecognised — wallet balance checks will be unavailable.",
+        );
     }
 
     let atr_refresh_secs = config.startup_defaults.atr_refresh_mins * 60;
-    let mut atr_refresh_interval: Option<tokio::time::Interval> = if should_fetch_atr(&algo_name, &options) {
-        let mut iv = tokio::time::interval(Duration::from_secs(atr_refresh_secs));
-        iv.tick().await;
-        Some(iv)
-    } else {
-        None
-    };
+    let mut atr_refresh_interval: Option<tokio::time::Interval> =
+        if should_fetch_atr(&algo_name, &options) {
+            let mut iv = tokio::time::interval(Duration::from_secs(atr_refresh_secs));
+            iv.tick().await;
+            Some(iv)
+        } else {
+            None
+        };
 
     let mut state = RunnerState {
         symbol: symbol.clone(),
@@ -213,7 +278,14 @@ pub async fn run_runner(
         last_ask: 0.0,
     };
 
-    crate::logger::log(&src, &format!("Runner started, algorithm: {}, mode: {}", algo_name, mode_label(&state.mode)));
+    crate::logger::log(
+        &src,
+        &format!(
+            "Runner started, algorithm: {}, mode: {}",
+            algo_name,
+            mode_label(&state.mode)
+        ),
+    );
 
     loop {
         tokio::select! {
@@ -354,24 +426,6 @@ pub async fn run_runner(
                         crate::logger::log(&src, "Runner resumed.");
                     }
 
-                    Some(RunnerControl::SetMode(new_mode)) => {
-                        match new_mode {
-                            RunnerMode::Live => {
-                                cancel_all_live_orders(&mut state, &engine).await;
-                                state.algorithm.on_live_enabled();
-                                state.pending_buy_orders.clear();
-                                state.pending_sell_orders.clear();
-                                state.mode = RunnerMode::Live;
-                                crate::logger::log(&src, "LIVE TRADING ENABLED — algorithm reset.");
-                            }
-                            RunnerMode::Simulation => {
-                                cancel_all_live_orders(&mut state, &engine).await;
-                                state.mode = RunnerMode::Simulation;
-                                crate::logger::log(&src, "Mode set to simulation.");
-                            }
-                        }
-                    }
-
                     Some(RunnerControl::SetAlgorithm { name, options }) => {
                         match build_algorithm(&name, &options) {
                             Ok(new_algo) => {
@@ -417,7 +471,10 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
         &format!(
             "[{}] last={:.2} bid={:.2} ask={:.2} vol={:.4}",
             market_data.timestamp.format("%H:%M:%S"),
-            market_data.last_price, market_data.bid, market_data.ask, market_data.volume,
+            market_data.last_price,
+            market_data.bid,
+            market_data.ask,
+            market_data.volume,
         ),
     );
 
@@ -438,7 +495,10 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
     if let Some(ref mut store) = state.trade_store
         && let Err(e) = store.append(&entry)
     {
-        crate::logger::log(&format!("RUNNER:{}", state.symbol), &format!("Warning: trade store write failed: {}", e));
+        crate::logger::log(
+            &format!("RUNNER:{}", state.symbol),
+            &format!("Warning: trade store write failed: {}", e),
+        );
     }
     state.trade_log.push(entry);
 }
@@ -448,16 +508,25 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
     state.live_order_ids.remove(&order_id);
     let fill_signals = if let Some((price, qty)) = state.pending_buy_orders.remove(&order_id) {
         let sigs = state.algorithm.on_fill(price, true);
-        crate::logger::log(&src, &format!("Buy order {} filled @ {:.2}.", order_id, price));
+        crate::logger::log(
+            &src,
+            &format!("Buy order {} filled @ {:.2}.", order_id, price),
+        );
         state.write_fill_to_db(order_id, true, price, qty);
         sigs
     } else if let Some((price, qty)) = state.pending_sell_orders.remove(&order_id) {
         let sigs = state.algorithm.on_fill(price, false);
-        crate::logger::log(&src, &format!("Sell order {} filled @ {:.2}.", order_id, price));
+        crate::logger::log(
+            &src,
+            &format!("Sell order {} filled @ {:.2}.", order_id, price),
+        );
         state.write_fill_to_db(order_id, false, price, qty);
         sigs
     } else {
-        crate::logger::log(&src, &format!("Order {} filled — not in pending maps.", order_id));
+        crate::logger::log(
+            &src,
+            &format!("Order {} filled — not in pending maps.", order_id),
+        );
         vec![]
     };
     if !fill_signals.is_empty() {
@@ -484,20 +553,34 @@ fn process_wallet_snapshot(state: &mut RunnerState, balances: Vec<(String, Strin
             state.wallet_balances.insert(currency, available);
         }
     }
-    crate::logger::log(&src, &format!("Wallet snapshot: {} balance(s) loaded.", state.wallet_balances.len()));
-    let base_bal  = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
+    crate::logger::log(
+        &src,
+        &format!(
+            "Wallet snapshot: {} balance(s) loaded.",
+            state.wallet_balances.len()
+        ),
+    );
+    let base_bal = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
     let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
     state.algorithm.on_balance_update(base_bal, quote_bal);
 }
 
-fn process_wallet_update(state: &mut RunnerState, wallet_type: String, currency: String, available: f64) {
+fn process_wallet_update(
+    state: &mut RunnerState,
+    wallet_type: String,
+    currency: String,
+    available: f64,
+) {
     if wallet_type == "exchange" {
         let src = format!("RUNNER:{}", state.symbol);
         let (base, quote) = extract_currencies(&state.symbol);
         if base.is_empty() || quote.is_empty() || currency == base || currency == quote {
             state.wallet_balances.insert(currency.clone(), available);
-            crate::logger::log(&src, &format!("Wallet update: {} available = {:.8}", currency, available));
-            let base_bal  = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
+            crate::logger::log(
+                &src,
+                &format!("Wallet update: {} available = {:.8}", currency, available),
+            );
+            let base_bal = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
             let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
             state.algorithm.on_balance_update(base_bal, quote_bal);
         }

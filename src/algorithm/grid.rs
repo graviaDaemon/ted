@@ -403,16 +403,6 @@ impl Algorithm for GridBot {
         }
     }
 
-    fn on_live_enabled(&mut self) {
-        self.buy_orders.clear();
-        self.sell_orders.clear();
-        self.last_price = None;
-        crate::logger::log(
-            "[GRID]",
-            "Live enabled — grid reset, will rebuild on next tick.",
-        );
-    }
-
     fn summary(&self) -> Option<String> {
         let lower = self.grid_lower().unwrap_or(0.0);
         let upper = self.grid_upper().unwrap_or(0.0);

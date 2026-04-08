@@ -1,4 +1,3 @@
-use crate::config::channels::RunnerMode;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 
@@ -32,11 +31,6 @@ impl Cli {
                         options,
                     });
                 }
-                if let Some(mode_str) = &run.set_mode {
-                    let mode = parse_mode(mode_str)?;
-                    return Ok(CliAction::SetMode { symbol, mode });
-                }
-
                 Ok(CliAction::Spawn {
                     symbol,
                     algorithm: run.algorithm.clone().unwrap_or_default(),
@@ -51,14 +45,6 @@ impl Cli {
             }),
             RunCommand::Exit => Ok(CliAction::Exit),
         }
-    }
-}
-
-fn parse_mode(s: &str) -> Result<RunnerMode, Box<dyn std::error::Error>> {
-    match s.to_ascii_lowercase().as_str() {
-        "simulation" => Ok(RunnerMode::Simulation),
-        "live" => Ok(RunnerMode::Live),
-        other => Err(format!("Unknown mode '{}': expected simulation or live", other).into()),
     }
 }
 
@@ -103,9 +89,6 @@ pub struct RunnerCommand {
     #[arg(short = 'c', long, value_name = "ALGORITHM")]
     pub configure: Option<String>,
 
-    #[arg(long, short = 'm', value_name = "simulation|live")]
-    pub set_mode: Option<String>,
-
     #[arg(long, short = 'l')]
     pub live: bool,
 }
@@ -142,10 +125,6 @@ pub enum CliAction {
         symbol: String,
         algorithm: String,
         options: HashMap<String, String>,
-    },
-    SetMode {
-        symbol: String,
-        mode: RunnerMode,
     },
     Generate {
         symbol: Option<String>,

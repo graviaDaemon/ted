@@ -119,6 +119,7 @@ struct Engine {
     subscribers: HashMap<String, mpsc::Sender<EngineEvent>>,
     auth_ws: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     auth_subscribers: Vec<mpsc::Sender<EngineEvent>>,
+    last_wallet_snapshot: Option<Vec<(String, String, f64)>>,
 }
 
 impl Engine {
@@ -150,6 +151,7 @@ impl Engine {
             subscribers: HashMap::new(),
             auth_ws,
             auth_subscribers: Vec::new(),
+            last_wallet_snapshot: None,
         };
 
         engine.event_loop().await;
@@ -213,6 +215,9 @@ impl Engine {
                     });
                     let _ = self.pub_ws.send(Message::Text(sub_msg.to_string().into())).await;
                 }
+                if let Some(balances) = &self.last_wallet_snapshot {
+                    let _ = event_tx.send(EngineEvent::WalletSnapshot { balances: balances.clone() }).await;
+                }
                 self.auth_subscribers.push(event_tx.clone());
                 self.subscribers.insert(symbol, event_tx);
             }
@@ -272,7 +277,10 @@ impl Engine {
             WsEvent::OrderFilled { order_id }                            => EngineEvent::OrderFilled { order_id },
             WsEvent::OrderCancelled { order_id }                         => EngineEvent::OrderCancelled { order_id },
             WsEvent::OrderNew { .. }                                     => EngineEvent::OrderNew,
-            WsEvent::WalletSnapshot { balances }                         => EngineEvent::WalletSnapshot { balances },
+            WsEvent::WalletSnapshot { balances }                         => {
+                self.last_wallet_snapshot = Some(balances.clone());
+                EngineEvent::WalletSnapshot { balances }
+            }
             WsEvent::WalletUpdate { wallet_type, currency, available }   => EngineEvent::WalletUpdate { wallet_type, currency, available },
             _ => return,
         };

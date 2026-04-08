@@ -12,7 +12,6 @@ pub enum RunnerControl {
         name: String,
         options: HashMap<String, String>,
     },
-    SetMode(RunnerMode),
     GenerateOverview {
         verbose: bool,
         reply: oneshot::Sender<String>,
