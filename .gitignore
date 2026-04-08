@@ -22,6 +22,7 @@ target
 
 # Configuration file, instead a template is provided in the repo
 config.json
+config.old.json
 
 # AI stub ignores
 .claudeignore

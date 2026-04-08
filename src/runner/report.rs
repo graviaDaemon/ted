@@ -1,4 +1,5 @@
 use super::RunnerState;
+use crate::api::TradeSignal;
 use crate::config::channels::RunnerMode;
 use chrono::Utc;
 use std::fs;
@@ -8,7 +9,6 @@ use std::path::PathBuf;
 pub fn build_content(state: &RunnerState, verbose: bool) -> String {
     let mode_str = match state.mode {
         RunnerMode::Simulation => "simulation",
-        RunnerMode::Paper => "paper",
         RunnerMode::Live => "**LIVE**",
     };
 
@@ -25,60 +25,52 @@ pub fn build_content(state: &RunnerState, verbose: bool) -> String {
         "| Started | {} UTC |\n",
         state.started_at.format("%Y-%m-%d %H:%M:%S")
     ));
-
-    let (db, runner_id) = match (&state.db, state.runner_db_id) {
-        (Some(db), Some(id)) => (db, id),
-        _ => {
-            md.push_str("| Data | No database session active |\n");
-            if let Some(summary) = state.algorithm.summary() {
-                md.push_str("\n## Algorithm Summary\n\n```\n");
-                md.push_str(&summary);
-                md.push_str("\n```\n");
-            }
-            return md;
-        }
-    };
-
-    let ticks = db.query_ticks(runner_id).unwrap_or_default();
-    let orders = db.query_orders(runner_id).unwrap_or_default();
-    let fills = db.query_fills(runner_id).unwrap_or_default();
-
-    let buy_orders = orders.iter().filter(|o| o.direction == "buy").count();
-    let sell_orders = orders.iter().filter(|o| o.direction == "sell").count();
-
-    match (ticks.first(), ticks.last()) {
-        (Some(f), Some(l)) => {
-            md.push_str(&format!(
-                "| Period | {} UTC – {} UTC |\n",
-                f.ts.get(..19).unwrap_or(&f.ts),
-                l.ts.get(..19).unwrap_or(&l.ts)
-            ));
-        }
-        _ => {
-            md.push_str("| Period | no ticks recorded |\n");
-        }
-    }
-
-    md.push_str(&format!("| Ticks | {} |\n", ticks.len()));
     md.push_str(&format!(
-        "| Signals | {} total ({} buy, {} sell) |\n",
-        buy_orders + sell_orders,
-        buy_orders,
-        sell_orders
+        "| Period | {} UTC – {} UTC |\n",
+        state.started_at.format("%Y-%m-%d %H:%M:%S"),
+        Utc::now().format("%Y-%m-%d %H:%M:%S"),
     ));
 
-    if !ticks.is_empty() {
-        let last_price = ticks.last().unwrap().last_price;
-        let (lo, hi) = ticks.iter().fold((f64::MAX, f64::MIN), |(lo, hi), t| {
+    let entries = &state.trade_log.entries;
+    md.push_str(&format!("| Ticks | {} |\n", entries.len()));
+
+    let signal_entries = state.trade_log.signal_entries();
+    let buy_signals: usize = signal_entries
+        .iter()
+        .map(|e| {
+            e.signals
+                .iter()
+                .filter(|s| matches!(s, TradeSignal::Buy { .. }))
+                .count()
+        })
+        .sum();
+    let sell_signals: usize = signal_entries
+        .iter()
+        .map(|e| {
+            e.signals
+                .iter()
+                .filter(|s| matches!(s, TradeSignal::Sell { .. }))
+                .count()
+        })
+        .sum();
+    md.push_str(&format!(
+        "| Signals | {} total ({} buy, {} sell) |\n",
+        buy_signals + sell_signals,
+        buy_signals,
+        sell_signals
+    ));
+
+    if !entries.is_empty() {
+        let last_price = entries.last().unwrap().last_price;
+        let (lo, hi) = entries.iter().fold((f64::MAX, f64::MIN), |(lo, hi), t| {
             (lo.min(t.last_price), hi.max(t.last_price))
         });
         md.push_str(&format!("| Price range | {:.2} – {:.2} |\n", lo, hi));
         md.push_str(&format!("| Last price | {:.2} |\n", last_price));
 
-        let cutoff = (Utc::now() - chrono::TimeDelta::hours(24)).to_rfc3339();
-        let day_ticks: Vec<_> = ticks.iter().filter(|t| t.ts >= cutoff).collect();
-        if day_ticks.len() >= 2 {
-            let open = day_ticks.first().unwrap().last_price;
+        let day_entries = state.trade_log.last_24h();
+        if day_entries.len() >= 2 {
+            let open = day_entries.first().unwrap().last_price;
             if open != 0.0 {
                 let pct = (last_price - open) / open * 100.0;
                 md.push_str(&format!("| 24h price change | {:+.5}% |\n", pct));
@@ -89,36 +81,23 @@ pub fn build_content(state: &RunnerState, verbose: bool) -> String {
             md.push_str("| 24h price change | N/A (< 24h data) |\n");
         }
 
-        let pnl = net_pnl_from_fills(&fills, last_price);
-        md.push_str(&format!("| Est. PnL | {:+.8} |\n", pnl));
+        if let (Some(db), Some(runner_id)) = (&state.db, state.runner_db_id) {
+            let fills = db.query_fills(runner_id).unwrap_or_default();
+            let pnl = net_pnl_from_fills(&fills, last_price);
+            md.push_str(&format!("| Est. PnL | {:+.8} |\n", pnl));
+            md.push('\n');
+
+            if verbose && !fills.is_empty() {
+                md.push_str(&pnl_breakdown_from_fills(&fills));
+            }
+        } else {
+            md.push_str("| Est. PnL | — |\n");
+            md.push('\n');
+        }
     } else {
         md.push_str("| 24h price change | N/A (no data) |\n");
         md.push_str("| Est. PnL | — |\n");
-    }
-    md.push('\n');
-
-    if buy_orders + sell_orders == 0 {
-        md.push_str("*No signals in this period.*\n");
-    }
-
-    if verbose && buy_orders + sell_orders > 0 {
-        md.push_str("## Orders\n\n");
-        md.push_str("| Placed | Type | Price | Qty | Status |\n|---|---|---|---|---|\n");
-        for o in &orders {
-            md.push_str(&format!(
-                "| {} UTC | {} | {:.2} | {:.8} | {} |\n",
-                o.placed_at.get(..19).unwrap_or(&o.placed_at),
-                o.direction.to_uppercase(),
-                o.price,
-                o.quantity,
-                o.status,
-            ));
-        }
         md.push('\n');
-
-        if !fills.is_empty() {
-            md.push_str(&pnl_breakdown_from_fills(&fills));
-        }
     }
 
     if let Some(summary) = state.algorithm.summary() {

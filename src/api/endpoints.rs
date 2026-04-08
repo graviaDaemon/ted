@@ -11,7 +11,6 @@ pub async fn place_order(
     symbol: &str,
     config: &Config,
     client: &reqwest::Client,
-    paper: bool,
 ) -> Result<OrderResult, Box<dyn std::error::Error + Send + Sync>> {
     let (price, quantity, sign, price_decimals) = match signal {
         TradeSignal::Buy  { price, quantity, price_decimals, .. } => (price, quantity,  1.0_f64, *price_decimals),
@@ -36,12 +35,12 @@ pub async fn place_order(
     let mut last_text   = String::new();
     'retry: for attempt in 1..=MAX_ATTEMPTS {
         let nonce = Utc::now().timestamp_millis().to_string();
-        let sig   = sign_rest_request(config.effective_secret(paper), path, &nonce, &body);
+        let sig   = sign_rest_request(config.active_secret(), path, &nonce, &body);
         let response = client
             .post(&url)
             .header("Content-Type",  "application/json")
             .header("bfx-nonce",     &nonce)
-            .header("bfx-apikey",    config.effective_key(paper))
+            .header("bfx-apikey",    config.active_key())
             .header("bfx-signature", &sig)
             .body(body.clone())
             .send()
@@ -85,6 +84,9 @@ pub async fn place_order(
     }
 
     let order_id = val[4][0][0].as_i64().unwrap_or(0);
+    if order_id == 0 {
+        return Err(format!("Order accepted (SUCCESS) but response contained no valid order ID — raw: {}", text).into());
+    }
 
     Ok(OrderResult { order_id, status, text: text_msg })
 }
@@ -93,19 +95,18 @@ pub async fn fetch_open_orders(
     symbol: &str,
     config: &Config,
     client: &reqwest::Client,
-    paper: bool,
 ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
     let path  = format!("/v2/auth/r/orders/{}", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
-    let sig   = sign_rest_request(config.effective_secret(paper), &path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.effective_key(paper))
+        .header("bfx-apikey",    config.active_key())
         .header("bfx-signature", &sig)
         .body(body)
         .send()
@@ -135,19 +136,18 @@ pub async fn fetch_order_history(
     symbol: &str,
     config: &Config,
     client: &reqwest::Client,
-    paper: bool,
 ) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error + Send + Sync>> {
     let path  = format!("/v2/auth/r/orders/{}/hist", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
-    let sig   = sign_rest_request(config.effective_secret(paper), &path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.effective_key(paper))
+        .header("bfx-apikey",    config.active_key())
         .header("bfx-signature", &sig)
         .body(body)
         .send()
@@ -182,19 +182,18 @@ pub async fn cancel_order(
     order_id: i64,
     config: &Config,
     client: &reqwest::Client,
-    paper: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path  = "/v2/auth/w/order/cancel";
     let nonce = Utc::now().timestamp_millis().to_string();
     let body  = serde_json::json!({ "id": order_id }).to_string();
-    let sig   = sign_rest_request(config.effective_secret(paper), path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(), path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.effective_key(paper))
+        .header("bfx-apikey",    config.active_key())
         .header("bfx-signature", &sig)
         .body(body)
         .send()

@@ -41,7 +41,7 @@ impl Cli {
                     symbol,
                     algorithm: run.algorithm.clone().unwrap_or_default(),
                     options,
-                    paper: run.paper,
+                    live: run.live,
                 })
             }
             RunCommand::Generate(generate) => Ok(CliAction::Generate {
@@ -57,13 +57,8 @@ impl Cli {
 fn parse_mode(s: &str) -> Result<RunnerMode, Box<dyn std::error::Error>> {
     match s.to_ascii_lowercase().as_str() {
         "simulation" => Ok(RunnerMode::Simulation),
-        "paper" => Ok(RunnerMode::Paper),
         "live" => Ok(RunnerMode::Live),
-        other => Err(format!(
-            "Unknown mode '{}': expected simulation, paper, or live",
-            other
-        )
-        .into()),
+        other => Err(format!("Unknown mode '{}': expected simulation or live", other).into()),
     }
 }
 
@@ -108,11 +103,11 @@ pub struct RunnerCommand {
     #[arg(short = 'c', long, value_name = "ALGORITHM")]
     pub configure: Option<String>,
 
-    #[arg(long, short = 'm', value_name = "simulation|paper|live")]
+    #[arg(long, short = 'm', value_name = "simulation|live")]
     pub set_mode: Option<String>,
 
-    #[arg(long)]
-    pub paper: bool,
+    #[arg(long, short = 'l')]
+    pub live: bool,
 }
 
 #[derive(Args, Debug)]
@@ -132,7 +127,7 @@ pub enum CliAction {
         symbol: String,
         algorithm: String,
         options: HashMap<String, String>,
-        paper: bool,
+        live: bool,
     },
     Pause {
         symbol: String,

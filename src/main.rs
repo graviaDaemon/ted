@@ -6,10 +6,13 @@ mod runner;
 mod storage;
 mod logger;
 mod tui;
+mod util;
+mod engine;
 
 use crate::config::config::Config;
 use crate::config::channels::{RunnerControl, RunnerMode};
 use crate::commands::cli::{Cli, CliAction};
+use crate::engine::spawn_engine;
 use std::collections::HashMap;
 use std::time::Duration;
 use clap::Parser;
@@ -26,7 +29,7 @@ async fn main() {
     let (log_tx, mut log_rx) = channel::<String>(256);
 
     let config = Config::load_config("config.json").expect("Failed to load config.json");
-    if let Err(e) = validate_config(&config) {
+    if let Err(e) = &config.validate() {
         eprintln!("Invalid config.json: {}", e);
         std::process::exit(1);
     }
@@ -46,6 +49,8 @@ async fn main() {
         }
     }
     tokio::spawn(crate::algorithm::script::watch_algorithms("algorithms", script_registry));
+    let (engine_handle, _engine_join) = spawn_engine(config.clone());
+
     let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
     let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
 
@@ -80,6 +85,7 @@ async fn main() {
                                     &mut runner_handles,
                                     line.trim(),
                                     &config,
+                                    &engine_handle,
                                 ).await
                             {
                                 break;
@@ -103,15 +109,6 @@ async fn main() {
 
     tui.exit();
     graceful_shutdown(&mut runner_txs, &mut runner_handles).await;
-}
-
-fn validate_config(c: &Config) -> Result<(), String> {
-    if c.credentials.live_key.is_empty()       { return Err("credentials.live_key is empty".into()); }
-    if c.credentials.live_secret.is_empty()    { return Err("credentials.live_secret is empty".into()); }
-    if c.api.ws_endpoint.is_empty()            { return Err("api.ws_endpoint is empty".into()); }
-    if c.api.auth_ws_endpoint.is_empty()       { return Err("api.auth_ws_endpoint is empty".into()); }
-    if c.api.auth_endpoint.is_empty()          { return Err("api.auth_endpoint is empty".into()); }
-    Ok(())
 }
 
 async fn graceful_shutdown(
@@ -150,6 +147,7 @@ async fn dispatch_line(
     runner_handles: &mut HashMap<String, JoinHandle<()>>,
     line: &str,
     config: &Config,
+    engine_handle: &crate::engine::EngineHandle,
 ) -> bool {
     let args: Vec<&str> = std::iter::once("ted")
         .chain(line.split_whitespace())
@@ -157,7 +155,7 @@ async fn dispatch_line(
     match Cli::try_parse_from(args) {
         Ok(cmd) => match cmd.handle_command() {
             Ok(CliAction::Exit) => return true,
-            Ok(action) => dispatch(runner_txs, runner_handles, action, config).await,
+            Ok(action) => dispatch(runner_txs, runner_handles, action, config, engine_handle).await,
             Err(e) => logger::log("[CTRL]", &format!("Error: {}", e)),
         },
         Err(e) => logger::log("[CTRL]", &format!("{}", e)),
@@ -170,15 +168,16 @@ async fn dispatch(
     runner_handles: &mut HashMap<String, JoinHandle<()>>,
     action: CliAction,
     config: &Config,
+    engine_handle: &crate::engine::EngineHandle,
 ) {
     match action {
-        CliAction::Spawn { symbol, algorithm, options, paper } => {
+        CliAction::Spawn { symbol, algorithm, options, live } => {
             if runner_txs.contains_key(&symbol) {
                 logger::log("[CTRL]", &format!("Runner for '{}' is already running.", symbol));
                 return;
             }
-            let mode = if paper || config.startup_defaults.paper {
-                RunnerMode::Paper
+            let mode = if live {
+                RunnerMode::Live
             } else {
                 RunnerMode::Simulation
             };
@@ -186,9 +185,10 @@ async fn dispatch(
             let sym = symbol.clone();
             let algo = algorithm.clone();
             let cfg = config.clone();
+            let eng = engine_handle.clone();
             let mode_label = format!("{:?}", mode).to_lowercase();
             let handle = tokio::spawn(async move {
-                crate::runner::run_runner(sym, algo, options, mode, rx, cfg).await;
+                crate::runner::run_runner(sym, algo, options, mode, rx, eng, cfg).await;
             });
             runner_txs.insert(symbol.clone(), tx);
             runner_handles.insert(symbol.clone(), handle);

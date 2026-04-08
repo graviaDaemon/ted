@@ -4,7 +4,6 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunnerMode {
     Simulation,
-    Paper,
     Live,
 }
 

@@ -16,22 +16,12 @@ pub struct ApiConfig {
     pub pub_endpoint: String,
     pub ws_endpoint: String,
     pub auth_ws_endpoint: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct CredentialsConfig {
-    pub live_key: String,
-    pub live_secret: String,
-    #[serde(default)]
-    pub paper_key: String,
-    #[serde(default)]
-    pub paper_secret: String,
+    pub key: String,
+    pub secret: String
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StartupDefaults {
-    #[serde(default)]
-    pub paper: bool,
     #[serde(default = "default_throttle_ms")]
     pub throttle_ms: u64,
     #[serde(default = "default_log_retention")]
@@ -43,25 +33,16 @@ pub struct StartupDefaults {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub api: ApiConfig,
-    pub credentials: CredentialsConfig,
     pub startup_defaults: StartupDefaults,
 }
 
 impl Config {
-    pub fn effective_key(&self, paper: bool) -> &str {
-        if paper {
-            &self.credentials.paper_key
-        } else {
-            &self.credentials.live_key
-        }
+    pub fn active_key(&self) -> &str {
+        &self.api.key
     }
 
-    pub fn effective_secret(&self, paper: bool) -> &str {
-        if paper {
-            &self.credentials.paper_secret
-        } else {
-            &self.credentials.live_secret
-        }
+    pub fn active_secret(&self) -> &str {
+        &self.api.secret
     }
 
     pub fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -73,9 +54,8 @@ impl Config {
                  \n\
                  Expected nested format:\n\
                  {{\n\
-                 \x20 \"api\": {{ \"auth_endpoint\": \"...\", \"pub_endpoint\": \"...\", \"ws_endpoint\": \"...\", \"auth_ws_endpoint\": \"...\" }},\n\
-                 \x20 \"credentials\": {{ \"live_key\": \"...\", \"live_secret\": \"...\", \"paper_key\": \"\", \"paper_secret\": \"\" }},\n\
-                 \x20 \"startup_defaults\": {{ \"paper\": false, \"throttle_ms\": 300, \"log_retention\": 7, \"atr_refresh_mins\": 60 }}\n\
+                 \x20 \"api\": {{ \"auth_endpoint\": \"...\", \"pub_endpoint\": \"...\", \"ws_endpoint\": \"...\", \"auth_ws_endpoint\": \"...\", \"key\": \"...\", \"secret\": \"...\" }},\n\
+                 \x20 \"startup_defaults\": {{ \"throttle_ms\": 300, \"log_retention\": 7, \"atr_refresh_mins\": 60 }}\n\
                  }}\n\
                  \n\
                  See config.template.json for the full template.",
@@ -83,5 +63,14 @@ impl Config {
             )
             .into()
         })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.api.key.is_empty()       { return Err("api.key is empty".into()); }
+        if self.api.secret.is_empty()    { return Err("api.secret is empty".into()); }
+        if self.api.ws_endpoint.is_empty()            { return Err("api.ws_endpoint is empty".into()); }
+        if self.api.auth_ws_endpoint.is_empty()       { return Err("api.auth_ws_endpoint is empty".into()); }
+        if self.api.auth_endpoint.is_empty()          { return Err("api.auth_endpoint is empty".into()); }
+        Ok(())
     }
 }

@@ -3,16 +3,11 @@
     "auth_endpoint":    "https://api.bitfinex.com",
     "pub_endpoint":     "https://api-pub.bitfinex.com",
     "ws_endpoint":      "wss://api-pub.bitfinex.com/ws/2",
-    "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2"
-  },
-  "credentials": {
-    "live_key":    "",
-    "live_secret": "",
-    "paper_key":   "",
-    "paper_secret": ""
+    "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2",
+    "key": "",
+    "secret": ""
   },
   "startup_defaults": {
-    "paper":            false,
     "throttle_ms":      300,
     "log_retention":    7,
     "atr_refresh_mins": 60

@@ -11,61 +11,6 @@ use crate::api::auth::sign_auth_payload;
 use crate::api::types::{MarketData, WsEvent};
 use crate::config::config::Config;
 
-pub async fn connect_and_subscribe(
-    symbol: &str,
-    config: &Config,
-) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, u64), Box<dyn Error>> {
-    let (mut ws_stream, _) = connect_async(config.api.ws_endpoint.as_str()).await?;
-    
-    loop {
-        let msg = ws_stream
-            .next()
-            .await
-            .ok_or("Connection closed before info event")??;
-        if let Message::Text(text) = msg {
-            let val: Value = serde_json::from_str(&text)?;
-            if val["event"] == "info" {
-                let status = val["platform"]["status"].as_u64().unwrap_or(0);
-                if status != 1 {
-                    return Err("Bitfinex platform is in maintenance mode".into());
-                }
-                break;
-            }
-        }
-    }
-    
-    let subscribe_msg = json!({
-        "event": "subscribe",
-        "channel": "ticker",
-        "symbol": format!("t{}", symbol)
-    });
-    ws_stream
-        .send(Message::Text(subscribe_msg.to_string().into()))
-        .await?;
-    
-    let chan_id = loop {
-        let msg = ws_stream
-            .next()
-            .await
-            .ok_or("Connection closed before subscribed event")??;
-        if let Message::Text(text) = msg {
-            let val: Value = serde_json::from_str(&text)?;
-            if val["event"] == "subscribed" && val["channel"] == "ticker" {
-                let id = val["chanId"]
-                    .as_u64()
-                    .ok_or("Missing chanId in subscribed event")?;
-                break id;
-            } else if val["event"] == "error" {
-                let code = val["code"].as_u64().unwrap_or(0);
-                let msg_text = val["msg"].as_str().unwrap_or("unknown");
-                return Err(format!("Subscription error {}: {}", code, msg_text).into());
-            }
-        }
-    };
-
-    Ok((ws_stream, chan_id))
-}
-
 pub fn parse_ticker(symbol: &str, raw: &[f64]) -> Result<MarketData, String> {
     if raw.len() < 10 {
         return Err(format!("Expected 10 ticker fields, got {}", raw.len()));
@@ -154,7 +99,6 @@ pub fn parse_ws_message(msg: &str, chan_map: &HashMap<u64, String>) -> WsEvent {
 
 pub async fn connect_authenticated(
     config: &Config,
-    paper: bool,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn Error>> {
     let (mut ws, _) = connect_async(config.api.auth_ws_endpoint.as_str()).await?;
     
@@ -178,10 +122,10 @@ pub async fn connect_authenticated(
     }
     
     let nonce = Utc::now().timestamp_millis().to_string();
-    let sig   = sign_auth_payload(config.effective_secret(paper), &nonce);
+    let sig   = sign_auth_payload(config.active_secret(), &nonce);
     let auth_msg = json!({
         "event":       "auth",
-        "apiKey":      config.effective_key(paper),
+        "apiKey":      config.active_key(),
         "authSig":     sig,
         "authNonce":   nonce,
         "authPayload": format!("AUTH{}", nonce),
