@@ -32,6 +32,11 @@ pub enum TradeSignal {
         reason: String,
         price_decimals: u32,
     },
+    Cancel {
+        price: f64,
+        is_buy: bool,
+        reason: String,
+    },
 }
 
 pub struct OrderResult {

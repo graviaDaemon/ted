@@ -284,7 +284,16 @@ impl Engine {
                 self.last_wallet_snapshot = Some(balances.clone());
                 EngineEvent::WalletSnapshot { balances }
             }
-            WsEvent::WalletUpdate { wallet_type, currency, available }   => EngineEvent::WalletUpdate { wallet_type, currency, available },
+            WsEvent::WalletUpdate { wallet_type, currency, available }   => {
+                if let Some(snapshot) = &mut self.last_wallet_snapshot {
+                    if let Some(entry) = snapshot.iter_mut().find(|(wt, cur, _)| wt == &wallet_type && cur == &currency) {
+                        entry.2 = available;
+                    } else {
+                        snapshot.push((wallet_type.clone(), currency.clone(), available));
+                    }
+                }
+                EngineEvent::WalletUpdate { wallet_type, currency, available }
+            }
             _ => return,
         };
         self.broadcast_all(ev).await;

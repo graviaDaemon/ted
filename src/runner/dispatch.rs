@@ -22,10 +22,41 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
     for sig in signals {
         let src = format!("RUNNER:{}", state.symbol);
         match sig {
+            TradeSignal::Cancel { price, is_buy, reason } => {
+                if state.mode == RunnerMode::Simulation {
+                    crate::logger::log(&src, &format!("[SIM] Cancel order at {:.6} — {}", price, reason));
+                    continue;
+                }
+                let order_id = if *is_buy {
+                    state.pending_buy_orders.iter()
+                        .find(|(_, (p, _))| (p - price).abs() < 1e-6)
+                        .map(|(&id, _)| id)
+                } else {
+                    state.pending_sell_orders.iter()
+                        .find(|(_, (p, _))| (p - price).abs() < 1e-6)
+                        .map(|(&id, _)| id)
+                };
+                if let Some(id) = order_id {
+                    crate::logger::log(&src, &format!("[live] Cancelling outer order {} — {}", id, reason));
+                    match engine.cancel_order(id).await {
+                        Ok(()) => {
+                            state.live_order_ids.remove(&id);
+                            if *is_buy {
+                                state.pending_buy_orders.remove(&id);
+                            } else {
+                                state.pending_sell_orders.remove(&id);
+                            }
+                        }
+                        Err(e) => crate::logger::log(&src, &format!("[live] Cancel order {} failed: {}", id, e)),
+                    }
+                } else {
+                    crate::logger::log(&src, &format!("[live] Cancel: no pending order at {:.6} — skipping.", price));
+                }
+            }
             TradeSignal::Buy { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT BUY {:.8} @ {:.2} — {}", quantity, price, reason));
-                    let _ = state.algorithm.on_fill(*price, true);
+                    let _ = state.algorithm.on_fill(*price, true, *price);
                     state.write_fill_to_db(None, true, *price, *quantity);
                 } else {
                     let (_, quote) = extract_currencies(&state.symbol);
@@ -54,14 +85,17 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
                                 state.pending_buy_orders.insert(result.order_id, (*price, *quantity));
                             }
                         }
-                        Err(e) => crate::logger::log(&src, &format!("[{}] BUY FAILED: {}", mode_label(&state.mode), e)),
+                        Err(e) => {
+                            crate::logger::log(&src, &format!("[{}] BUY FAILED: {}", mode_label(&state.mode), e));
+                            state.algorithm.on_order_failed(*price, true);
+                        }
                     }
                 }
             }
             TradeSignal::Sell { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT SELL {:.8} @ {:.2} — {}", quantity, price, reason));
-                    let _ = state.algorithm.on_fill(*price, false);
+                    let _ = state.algorithm.on_fill(*price, false, *price);
                     state.write_fill_to_db(None, false, *price, *quantity);
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);
@@ -90,7 +124,10 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
                                 state.pending_sell_orders.insert(result.order_id, (*price, *quantity));
                             }
                         }
-                        Err(e) => crate::logger::log(&src, &format!("[{}] SELL FAILED: {}", mode_label(&state.mode), e)),
+                        Err(e) => {
+                            crate::logger::log(&src, &format!("[{}] SELL FAILED: {}", mode_label(&state.mode), e));
+                            state.algorithm.on_order_failed(*price, false);
+                        }
                     }
                 }
             }

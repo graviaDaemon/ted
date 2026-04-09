@@ -7,7 +7,9 @@ pub struct GridBot {
     qty: f64,
     spacing: f64,
     price_decimals: u32,
-    spread_ratio: f64,
+
+    grid_lower_bound: f64,
+    grid_upper_bound: f64,
 
     buy_orders: HashMap<u64, f64>,
     sell_orders: HashMap<u64, f64>,
@@ -61,11 +63,6 @@ impl GridBot {
             return Err("Option 'spacing' must be positive".to_string());
         }
 
-        let spread_ratio = options
-            .get("spread_ratio")
-            .map(|v| v.parse::<f64>().unwrap_or(1.1))
-            .unwrap_or(1.1);
-
         let base_balance = options
             .get("initial_base_balance")
             .and_then(|v| v.parse::<f64>().ok())
@@ -81,7 +78,8 @@ impl GridBot {
             qty,
             spacing,
             price_decimals,
-            spread_ratio,
+            grid_lower_bound: 0.0,
+            grid_upper_bound: 0.0,
             buy_orders: HashMap::new(),
             sell_orders: HashMap::new(),
             base_balance,
@@ -120,28 +118,33 @@ impl GridBot {
 
         let m = 10_f64.powi(self.price_decimals as i32);
 
-        let seeded_sells =
-            (self.levels_per_side as f64).min((self.base_balance / self.qty).floor()) as u32;
-        let seeded_buys = (self.levels_per_side as f64)
-            .min((self.quote_balance / (midpoint * self.qty)).floor())
-            as u32;
-
         self.buy_orders.clear();
         self.sell_orders.clear();
 
-        let gap = self.spacing * self.spread_ratio;
-
-        for i in 0..seeded_buys {
-            let price = ((midpoint - gap - i as f64 * self.spacing) * m).round() / m;
+        for i in 0..self.levels_per_side {
+            let price = ((midpoint - (i as f64 + 1.0) * self.spacing) * m).round() / m;
             if price > 0.0 {
                 self.buy_orders.insert(self.price_key(price), price);
             }
         }
 
-        for i in 0..seeded_sells {
-            let price = ((midpoint + gap + i as f64 * self.spacing) * m).round() / m;
+        for i in 0..self.levels_per_side {
+            let price = ((midpoint + (i as f64 + 1.0) * self.spacing) * m).round() / m;
             self.sell_orders.insert(self.price_key(price), price);
         }
+
+        self.grid_lower_bound = self
+            .buy_orders
+            .values()
+            .copied()
+            .reduce(f64::min)
+            .unwrap_or(midpoint - self.spacing * self.levels_per_side as f64);
+        self.grid_upper_bound = self
+            .sell_orders
+            .values()
+            .copied()
+            .reduce(f64::max)
+            .unwrap_or(midpoint + self.spacing * self.levels_per_side as f64);
 
         crate::logger::log(
             "[GRID]",
@@ -154,14 +157,6 @@ impl GridBot {
                 prec = self.price_decimals as usize,
             ),
         );
-
-        if seeded_buys == 0 {
-            crate::logger::log(
-                "[GRID]",
-                "Insufficient funds to place even one buy order — refusing to start.",
-            );
-            return vec![];
-        }
 
         let prec = self.price_decimals as usize;
         let mut signals: Vec<TradeSignal> = Vec::new();
@@ -248,16 +243,14 @@ impl Algorithm for GridBot {
             return signals;
         }
 
-        let lower = self.grid_lower().unwrap_or(0.0);
-        let upper = self.grid_upper().unwrap_or(f64::MAX);
-        if (!self.buy_orders.is_empty() && price < lower * 0.95)
-            || (!self.sell_orders.is_empty() && price > upper * 1.05)
+        if self.grid_lower_bound > 0.0
+            && (price < self.grid_lower_bound * 0.95 || price > self.grid_upper_bound * 1.05)
         {
             crate::logger::log(
                 "[GRID]",
                 &format!(
                     "Price {:.2} is far outside grid [{:.2}–{:.2}] — rebuilding.",
-                    price, lower, upper
+                    price, self.grid_lower_bound, self.grid_upper_bound
                 ),
             );
             self.buy_orders.clear();
@@ -309,67 +302,147 @@ impl Algorithm for GridBot {
         signals
     }
 
-    fn on_fill(&mut self, price: f64, is_buy: bool) -> Vec<TradeSignal> {
+    fn on_fill(&mut self, fill_price: f64, is_buy: bool, current_price: f64) -> Vec<TradeSignal> {
+        let current_price = if current_price <= 0.0 {
+            fill_price
+        } else {
+            current_price
+        };
         let m = 10_f64.powi(self.price_decimals as i32);
         let prec = self.price_decimals as usize;
+        let mut signals: Vec<TradeSignal> = Vec::new();
 
         if is_buy {
-            self.buy_orders.remove(&self.price_key(price));
+            self.buy_orders.remove(&self.price_key(fill_price));
             self.position += self.qty;
             self.total_buys += 1;
 
-            let counter = ((price + self.spacing) * m).round() / m;
+            if self.sell_orders.len() >= self.levels_per_side as usize
+                && let Some(outer_sell) = self.sell_orders.values().copied().reduce(f64::max)
+            {
+                self.sell_orders.remove(&self.price_key(outer_sell));
+                signals.push(TradeSignal::Cancel {
+                    price: outer_sell,
+                    is_buy: false,
+                    reason: format!(
+                        "Sliding grid: replace outermost sell {:.prec$}",
+                        outer_sell,
+                        prec = prec
+                    ),
+                });
+            }
+
+            let counter = ((current_price + self.spacing) * m).round() / m;
             self.sell_orders.insert(self.price_key(counter), counter);
             crate::logger::log(
                 "[GRID]",
                 &format!(
                     "Buy filled @ {:.prec$} — counter sell at {:.prec$}",
-                    price,
+                    fill_price,
                     counter,
                     prec = prec
                 ),
             );
-            vec![TradeSignal::Sell {
+            signals.push(TradeSignal::Sell {
                 price: counter,
                 quantity: self.qty,
                 reason: format!("Grid counter sell at {:.prec$}", counter, prec = prec),
                 price_decimals: self.price_decimals,
-            }]
+            });
+
+            let lowest_buy = self
+                .buy_orders
+                .values()
+                .copied()
+                .reduce(f64::min)
+                .unwrap_or(fill_price);
+            let extension = ((lowest_buy - self.spacing) * m).round() / m;
+            if extension > 0.0 {
+                self.buy_orders.insert(self.price_key(extension), extension);
+                self.grid_lower_bound = extension;
+                signals.push(TradeSignal::Buy {
+                    price: extension,
+                    quantity: self.qty,
+                    reason: format!("Grid extension buy at {:.prec$}", extension, prec = prec),
+                    price_decimals: self.price_decimals,
+                });
+            }
         } else {
-            self.sell_orders.remove(&self.price_key(price));
+            self.sell_orders.remove(&self.price_key(fill_price));
             self.position -= self.qty;
             self.total_sells += 1;
             self.realized_pnl += self.spacing * self.qty;
 
-            let counter = ((price - self.spacing) * m).round() / m;
+            if self.buy_orders.len() >= self.levels_per_side as usize
+                && let Some(outer_buy) = self.buy_orders.values().copied().reduce(f64::min)
+            {
+                self.buy_orders.remove(&self.price_key(outer_buy));
+                signals.push(TradeSignal::Cancel {
+                    price: outer_buy,
+                    is_buy: true,
+                    reason: format!(
+                        "Sliding grid: replace outermost buy {:.prec$}",
+                        outer_buy,
+                        prec = prec
+                    ),
+                });
+            }
+
+            let counter = ((current_price - self.spacing) * m).round() / m;
             if counter > 0.0 {
                 self.buy_orders.insert(self.price_key(counter), counter);
                 crate::logger::log(
                     "[GRID]",
                     &format!(
                         "Sell filled @ {:.prec$} — counter buy at {:.prec$}",
-                        price,
+                        fill_price,
                         counter,
                         prec = prec
                     ),
                 );
-                vec![TradeSignal::Buy {
+                signals.push(TradeSignal::Buy {
                     price: counter,
                     quantity: self.qty,
                     reason: format!("Grid counter buy at {:.prec$}", counter, prec = prec),
                     price_decimals: self.price_decimals,
-                }]
+                });
             } else {
                 crate::logger::log(
                     "[GRID]",
                     &format!(
                         "Sell filled @ {:.prec$} — counter buy skipped (price would be <= 0)",
-                        price,
+                        fill_price,
                         prec = prec
                     ),
                 );
-                vec![]
             }
+
+            let highest_sell = self
+                .sell_orders
+                .values()
+                .copied()
+                .reduce(f64::max)
+                .unwrap_or(fill_price);
+            let extension = ((highest_sell + self.spacing) * m).round() / m;
+            self.sell_orders
+                .insert(self.price_key(extension), extension);
+            self.grid_upper_bound = extension;
+            signals.push(TradeSignal::Sell {
+                price: extension,
+                quantity: self.qty,
+                reason: format!("Grid extension sell at {:.prec$}", extension, prec = prec),
+                price_decimals: self.price_decimals,
+            });
+        }
+
+        signals
+    }
+
+    fn on_order_failed(&mut self, price: f64, is_buy: bool) {
+        if is_buy {
+            self.buy_orders.remove(&self.price_key(price));
+        } else {
+            self.sell_orders.remove(&self.price_key(price));
         }
     }
 
@@ -407,10 +480,10 @@ impl Algorithm for GridBot {
         let lower = self.grid_lower().unwrap_or(0.0);
         let upper = self.grid_upper().unwrap_or(0.0);
         Some(format!(
-            "GridBot\n  Levels/side:  {}\n  Range:        {:.prec$} – {:.prec$}\n  Spacing:      {:.prec$}  |  Spread ratio: {:.2}\n  Trades:       {} buys, {} sells\n  Orders:       {} buy open, {} sell open\n  Position:     {:.8} (net qty)\n  Realized PnL: {:.8}",
+            "GridBot\n  Levels/side:  {}\n  Range:        {:.prec$} – {:.prec$}\n  Spacing:      {:.prec$}\n  Trades:       {} buys, {} sells\n  Orders:       {} buy open, {} sell open\n  Position:     {:.8} (net qty)\n  Realized PnL: {:.8}",
             self.levels_per_side,
             lower, upper,
-            self.spacing, self.spread_ratio,
+            self.spacing,
             self.total_buys, self.total_sells,
             self.buy_orders.len(), self.sell_orders.len(),
             self.position,

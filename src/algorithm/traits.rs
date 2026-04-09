@@ -6,9 +6,10 @@ use std::collections::HashMap;
 pub trait Algorithm: Send {
     fn name(&self) -> &str;
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal>;
-    fn on_fill(&mut self, _price: f64, _is_buy: bool) -> Vec<TradeSignal> {
+    fn on_fill(&mut self, _price: f64, _is_buy: bool, _current_price: f64) -> Vec<TradeSignal> {
         vec![]
     }
+    fn on_order_failed(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
     fn on_spacing_update(&mut self, _new_spacing: f64) {}
     fn on_balance_update(&mut self, _base: f64, _quote: f64) {}

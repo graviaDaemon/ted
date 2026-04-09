@@ -13,8 +13,9 @@ pub async fn place_order(
     client: &reqwest::Client,
 ) -> Result<OrderResult, Box<dyn std::error::Error + Send + Sync>> {
     let (price, quantity, sign, price_decimals) = match signal {
-        TradeSignal::Buy  { price, quantity, price_decimals, .. } => (price, quantity,  1.0_f64, *price_decimals),
-        TradeSignal::Sell { price, quantity, price_decimals, .. } => (price, quantity, -1.0_f64, *price_decimals),
+        TradeSignal::Buy    { price, quantity, price_decimals, .. } => (price, quantity,  1.0_f64, *price_decimals),
+        TradeSignal::Sell   { price, quantity, price_decimals, .. } => (price, quantity, -1.0_f64, *price_decimals),
+        TradeSignal::Cancel { .. } => return Err("Cancel signal must not be passed to place_order".into()),
     };
 
     let amount = sign * quantity;

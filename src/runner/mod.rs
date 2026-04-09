@@ -324,18 +324,23 @@ pub async fn run_runner(
                             .filter(|(id, _)| !snapshot.contains(*id))
                             .map(|(&id, &(p, q))| (id, p, q))
                             .collect();
+                        let current_price = if state.last_bid > 0.0 && state.last_ask > 0.0 {
+                            (state.last_bid + state.last_ask) / 2.0
+                        } else {
+                            0.0
+                        };
                         let mut fill_signals = vec![];
                         for (id, price, qty) in &filled_buys {
                             state.live_order_ids.remove(id);
                             state.pending_buy_orders.remove(id);
-                            fill_signals.extend(state.algorithm.on_fill(*price, true));
+                            fill_signals.extend(state.algorithm.on_fill(*price, true, current_price));
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
                             state.write_fill_to_db(Some(*id), true, *price, *qty);
                         }
                         for (id, price, qty) in &filled_sells {
                             state.live_order_ids.remove(id);
                             state.pending_sell_orders.remove(id);
-                            fill_signals.extend(state.algorithm.on_fill(*price, false));
+                            fill_signals.extend(state.algorithm.on_fill(*price, false, current_price));
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
                             state.write_fill_to_db(Some(*id), false, *price, *qty);
                         }
@@ -495,9 +500,14 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
 
 async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: i64) {
     let src = format!("RUNNER:{}", state.symbol);
-    state.live_order_ids.remove(&order_id);
+    let current_price = if state.last_bid > 0.0 && state.last_ask > 0.0 {
+        (state.last_bid + state.last_ask) / 2.0
+    } else {
+        0.0
+    };
     let fill_signals = if let Some((price, qty)) = state.pending_buy_orders.remove(&order_id) {
-        let sigs = state.algorithm.on_fill(price, true);
+        state.live_order_ids.remove(&order_id);
+        let sigs = state.algorithm.on_fill(price, true, current_price);
         crate::logger::log(
             &src,
             &format!("Buy order {} filled @ {:.2}.", order_id, price),
@@ -505,7 +515,8 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
         state.write_fill_to_db(Some(order_id), true, price, qty);
         sigs
     } else if let Some((price, qty)) = state.pending_sell_orders.remove(&order_id) {
-        let sigs = state.algorithm.on_fill(price, false);
+        state.live_order_ids.remove(&order_id);
+        let sigs = state.algorithm.on_fill(price, false, current_price);
         crate::logger::log(
             &src,
             &format!("Sell order {} filled @ {:.2}.", order_id, price),
@@ -513,10 +524,12 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
         state.write_fill_to_db(Some(order_id), false, price, qty);
         sigs
     } else {
-        crate::logger::log(
-            &src,
-            &format!("Order {} filled — not in pending maps.", order_id),
-        );
+        if state.live_order_ids.remove(&order_id) {
+            crate::logger::log(
+                &src,
+                &format!("Order {} filled — tracked but not in pending maps (internal inconsistency).", order_id),
+            );
+        }
         vec![]
     };
     if !fill_signals.is_empty() {
@@ -526,10 +539,12 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
 
 fn process_cancelled(state: &mut RunnerState, order_id: i64) {
     let src = format!("RUNNER:{}", state.symbol);
-    state.live_order_ids.remove(&order_id);
+    let was_tracked = state.live_order_ids.remove(&order_id);
     state.pending_buy_orders.remove(&order_id);
     state.pending_sell_orders.remove(&order_id);
-    crate::logger::log(&src, &format!("Order {} cancelled.", order_id));
+    if was_tracked {
+        crate::logger::log(&src, &format!("Order {} cancelled.", order_id));
+    }
 }
 
 fn process_wallet_snapshot(state: &mut RunnerState, balances: Vec<(String, String, f64)>) {
