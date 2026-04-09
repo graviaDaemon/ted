@@ -117,7 +117,7 @@ async fn graceful_shutdown(
 ) {
     let symbols: Vec<String> = runner_txs.keys().cloned().collect();
     for symbol in &symbols {
-        send_control(runner_txs, symbol, RunnerControl::Kill).await;
+        send_control(runner_txs, runner_handles, symbol, RunnerControl::Kill).await;
     }
     runner_txs.clear();
     for (_, handle) in runner_handles.drain() {
@@ -127,6 +127,7 @@ async fn graceful_shutdown(
 
 async fn send_control(
     runner_txs: &mut HashMap<String, Sender<RunnerControl>>,
+    runner_handles: &mut HashMap<String, JoinHandle<()>>,
     symbol: &str,
     control: RunnerControl,
 ) {
@@ -136,6 +137,7 @@ async fn send_control(
             if tx.send(control).await.is_err() {
                 logger::log("[CTRL]", &format!("Runner '{}' is no longer alive; removing.", symbol));
                 runner_txs.remove(symbol);
+                runner_handles.remove(symbol);
             }
         }
         None => logger::log("[CTRL]", &format!("No runner found for symbol '{}'", symbol)),
@@ -196,15 +198,15 @@ async fn dispatch(
         }
 
         CliAction::Pause { symbol } => {
-            send_control(runner_txs, &symbol, RunnerControl::Pause).await;
+            send_control(runner_txs, runner_handles, &symbol, RunnerControl::Pause).await;
         }
 
         CliAction::Resume { symbol } => {
-            send_control(runner_txs, &symbol, RunnerControl::Resume).await;
+            send_control(runner_txs, runner_handles, &symbol, RunnerControl::Resume).await;
         }
 
         CliAction::Kill { symbol } => {
-            send_control(runner_txs, &symbol, RunnerControl::Kill).await;
+            send_control(runner_txs, runner_handles, &symbol, RunnerControl::Kill).await;
             runner_txs.remove(&symbol);
             if let Some(handle) = runner_handles.remove(&symbol) {
                 let _ = handle.await;
@@ -214,6 +216,7 @@ async fn dispatch(
         CliAction::Configure { symbol, algorithm, options } => {
             send_control(
                 runner_txs,
+                runner_handles,
                 &symbol,
                 RunnerControl::SetAlgorithm { name: algorithm, options },
             )
@@ -227,7 +230,7 @@ async fn dispatch(
 
                 for sym in &symbols {
                     let (tx, rx) = oneshot::channel::<String>();
-                    send_control(runner_txs, sym, RunnerControl::GenerateOverview { verbose, reply: tx }).await;
+                    send_control(runner_txs, runner_handles, sym, RunnerControl::GenerateOverview { verbose, reply: tx }).await;
                     match timeout(Duration::from_secs(10), rx).await {
                         Ok(Ok(content)) => contents.push((sym.clone(), content)),
                         Ok(Err(_)) => logger::log(
@@ -253,7 +256,7 @@ async fn dispatch(
                 }
             } else if let Some(sym) = symbol {
                 let (tx, rx) = oneshot::channel::<String>();
-                send_control(runner_txs, &sym, RunnerControl::GenerateOverview { verbose, reply: tx }).await;
+                send_control(runner_txs, runner_handles, &sym, RunnerControl::GenerateOverview { verbose, reply: tx }).await;
                 match timeout(Duration::from_secs(10), rx).await {
                     Ok(Ok(content)) => {
                         match crate::runner::report::write_report(&sym, &content) {

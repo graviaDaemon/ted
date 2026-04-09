@@ -330,14 +330,14 @@ pub async fn run_runner(
                             state.pending_buy_orders.remove(id);
                             fill_signals.extend(state.algorithm.on_fill(*price, true));
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(*id, true, *price, *qty);
+                            state.write_fill_to_db(Some(*id), true, *price, *qty);
                         }
                         for (id, price, qty) in &filled_sells {
                             state.live_order_ids.remove(id);
                             state.pending_sell_orders.remove(id);
                             fill_signals.extend(state.algorithm.on_fill(*price, false));
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(*id, false, *price, *qty);
+                            state.write_fill_to_db(Some(*id), false, *price, *qty);
                         }
                         let stale: Vec<i64> = state.live_order_ids.iter().copied().filter(|id| !snapshot.contains(id)).collect();
                         for id in &stale { state.live_order_ids.remove(id); }
@@ -512,7 +512,7 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
             &src,
             &format!("Buy order {} filled @ {:.2}.", order_id, price),
         );
-        state.write_fill_to_db(order_id, true, price, qty);
+        state.write_fill_to_db(Some(order_id), true, price, qty);
         sigs
     } else if let Some((price, qty)) = state.pending_sell_orders.remove(&order_id) {
         let sigs = state.algorithm.on_fill(price, false);
@@ -520,7 +520,7 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
             &src,
             &format!("Sell order {} filled @ {:.2}.", order_id, price),
         );
-        state.write_fill_to_db(order_id, false, price, qty);
+        state.write_fill_to_db(Some(order_id), false, price, qty);
         sigs
     } else {
         crate::logger::log(

@@ -18,7 +18,7 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS runners (

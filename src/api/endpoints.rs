@@ -96,7 +96,7 @@ pub async fn fetch_open_orders(
     config: &Config,
     client: &reqwest::Client,
 ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
-    let path  = format!("/v2/auth/r/orders/{}", symbol);
+    let path  = format!("/v2/auth/r/orders/t{}", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
     let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);
@@ -137,7 +137,7 @@ pub async fn fetch_order_history(
     config: &Config,
     client: &reqwest::Client,
 ) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error + Send + Sync>> {
-    let path  = format!("/v2/auth/r/orders/{}/hist", symbol);
+    let path  = format!("/v2/auth/r/orders/t{}/hist", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
     let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);

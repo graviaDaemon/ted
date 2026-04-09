@@ -30,16 +30,11 @@ Copy `config.template.json` to `config.json` and fill in your credentials:
     "auth_endpoint":    "https://api.bitfinex.com",
     "pub_endpoint":     "https://api-pub.bitfinex.com",
     "ws_endpoint":      "wss://api-pub.bitfinex.com/ws/2",
-    "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2"
-  },
-  "credentials": {
-    "live_key":    "YOUR_LIVE_API_KEY",
-    "live_secret": "YOUR_LIVE_API_SECRET",
-    "paper_key":   "YOUR_PAPER_API_KEY",
-    "paper_secret": "YOUR_PAPER_API_SECRET"
+    "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2",
+    "key": "YOUR_API_KEY",
+    "secret": "YOUR_API_SECRET"
   },
   "startup_defaults": {
-    "paper":            false,
     "throttle_ms":      300,
     "log_retention":    7,
     "atr_refresh_mins": 60
@@ -47,18 +42,16 @@ Copy `config.template.json` to `config.json` and fill in your credentials:
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `api.auth_endpoint` | Base URL for authenticated REST calls |
-| `api.pub_endpoint` | Base URL for public REST calls (candle fetches) |
-| `api.ws_endpoint` | Public WebSocket endpoint (ticker streaming) |
-| `api.auth_ws_endpoint` | Authenticated WebSocket endpoint (order events) |
-| `credentials.live_key/secret` | API key and secret for your live Bitfinex account |
-| `credentials.paper_key/secret` | API key and secret for your Bitfinex paper trading sub-account |
-| `startup_defaults.paper` | Start runners in paper mode by default (`true`/`false`) |
-| `startup_defaults.throttle_ms` | Minimum milliseconds between ticks processed |
-| `startup_defaults.log_retention` | Days of log files to keep |
-| `startup_defaults.atr_refresh_mins` | How often (in minutes) to refetch ATR for dynamic grid spacing |
+| Field                               | Description                                                                                         |
+|-------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `api.auth_endpoint`                 | Base URL for authenticated REST calls                                                               |
+| `api.pub_endpoint`                  | Base URL for public REST calls (candle fetches)                                                     |
+| `api.ws_endpoint`                   | Public WebSocket endpoint (ticker streaming)                                                        |
+| `api.auth_ws_endpoint`              | Authenticated WebSocket endpoint (order events)                                                     |
+| `api.key/secret`                    | API key and secret for your live Bitfinex account. This can be the paper-trading api or regular api |
+| `startup_defaults.throttle_ms`      | Minimum milliseconds between ticks processed                                                        |
+| `startup_defaults.log_retention`    | Days of log files to keep                                                                           |
+| `startup_defaults.atr_refresh_mins` | How often (in minutes) to refetch ATR for dynamic grid spacing                                      |
 
 ### Setting up paper trading credentials
 
@@ -93,18 +86,18 @@ Each runner is an independent async task that streams market data for one symbol
 
 **Spawn a new runner:**
 ```
-runner --symbol BTCUSD
-runner --symbol BTCUSD --algorithm grid --option levels=5 qty=0.001 atr_period=14
-runner --symbol ETHUSD --algorithm example --option period=30 qty=0.01
-runner --symbol LTCUSD --algorithm grid --option levels=5 qty=0.1 atr_period=14 --paper
+runner [-s, --symbol] BTCUSD
+runner [-s, --symbol] BTCUSD [-a, --algorithm] grid [-o, --option] levels=5 qty=0.001 atr_period=14
+runner [-s, --symbol] ETHUSD [-a, --algorithm] example [-o, --option] atr_period=30 qty=0.01
+runner [-s, --symbol] LTCUSD [-a, --algorithm] grid [-o, --option] levels=5 qty=0.1 atr_period=14 [-l, --live]
 ```
 
-| Flag | Short | Description |
-|------|-------|-------------|
-| `--symbol <SYM>` | `-s` | Trading pair symbol (required) |
-| `--algorithm <NAME>` | `-a` | Algorithm name: `passive`, `grid`, or any script name (default: `passive`) |
-| `--option <KEY=VALUE>` | | Algorithm options; repeat for multiple |
-| `--paper` | | Start this runner in paper mode (overrides `startup_defaults.paper`) |
+| Flag                   | Short | Description                                                                |
+|------------------------|------|----------------------------------------------------------------------------|
+| `--symbol <SYM>`       | `-s` | Trading pair symbol (required)                                             |
+| `--algorithm <NAME>`   | `-a` | Algorithm name: `passive`, `grid`, or any script name (default: `passive`) |
+| `--option <KEY=VALUE>` |      | Algorithm options; repeat for multiple                                     |
+| `--live`               | `-l` | Start this runner in live mode (defaults to simulation)                    |
 
 **Lifecycle:**
 ```
@@ -118,16 +111,8 @@ runner -s BTCUSD --kill           # stop runner and cancel any open orders
 runner -s BTCUSD --configure grid --option levels=5 qty=0.002 atr_period=14
 ```
 
-**Switch trading mode:**
-```
-runner -s BTCUSD --set-mode simulation   # log-only, no API calls
-runner -s BTCUSD --set-mode paper        # orders against paper account
-runner -s BTCUSD --set-mode live         # real orders on live account
-```
-
 There are three modes:
 - **simulation** — no API calls; fills are simulated immediately on signal. The default when paper credentials are absent or `startup_defaults.paper` is `false`.
-- **paper** — places and tracks real orders against the Bitfinex paper trading account using paper credentials.
 - **live** — places and tracks real orders against the live account.
 
 ---

@@ -30,11 +30,17 @@ pub struct RunnerState {
 }
 
 impl RunnerState {
-    pub fn write_fill_to_db(&mut self, exchange_id: i64, is_buy: bool, price: f64, qty: f64) {
+    pub fn write_fill_to_db(
+        &mut self,
+        exchange_id: Option<i64>,
+        is_buy: bool,
+        price: f64,
+        qty: f64,
+    ) {
         if let (Some(db), Some(runner_id)) = (&self.db, self.runner_db_id) {
             let _ = db.insert_fill(&FillRow {
                 runner_id,
-                exchange_id: Some(exchange_id),
+                exchange_id,
                 direction: if is_buy { "buy" } else { "sell" }.to_string(),
                 price,
                 quantity: qty,

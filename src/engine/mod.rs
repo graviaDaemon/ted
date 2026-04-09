@@ -219,6 +219,9 @@ impl Engine {
                     let _ = event_tx.send(EngineEvent::WalletSnapshot { balances: balances.clone() }).await;
                 }
                 self.auth_subscribers.push(event_tx.clone());
+                if self.auth_ws.is_some() {
+                    let _ = event_tx.send(EngineEvent::AuthConnected).await;
+                }
                 self.subscribers.insert(symbol, event_tx);
             }
             EngineRequest::Unsubscribe { symbol } => {
@@ -338,12 +341,17 @@ impl Engine {
                 Ok(ws) => {
                     self.auth_ws = Some(ws);
                     crate::logger::log("[ENGINE]", "Auth WS reconnected.");
-                    return;
                 }
-                Err(e) => crate::logger::log("[ENGINE]", &format!("Auth WS reconnect {}/{} failed: {}", attempt, MAX_ATTEMPTS, e)),
+                Err(e) => {
+                    crate::logger::log("[ENGINE]", &format!("Auth WS reconnect {}/{} failed: {}", attempt, MAX_ATTEMPTS, e));
+                    continue;
+                }
             }
+            self.broadcast_all(EngineEvent::AuthConnected).await;
+            return;
         }
         crate::logger::log("[ENGINE]", "Auth WS reconnect exhausted.");
+        self.broadcast_all(EngineEvent::EngineShutdown).await;
     }
 
     async fn next_auth(

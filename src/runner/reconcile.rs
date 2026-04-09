@@ -43,7 +43,7 @@ pub async fn sync_orders_after_reconnect(src: &str, symbol: &str, state: &mut Ru
                 state.live_order_ids.remove(&order_id);
                 let fill_signals = state.algorithm.on_fill(price, is_buy);
                 crate::logger::log(src, &format!("Reconnect sync: order {} filled @ {:.2}.", order_id, price));
-                state.write_fill_to_db(order_id, is_buy, price, qty);
+                state.write_fill_to_db(Some(order_id), is_buy, price, qty);
                 if !fill_signals.is_empty() {
                     dispatch::dispatch_signals(state, &fill_signals, engine).await;
                 }
