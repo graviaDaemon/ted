@@ -74,7 +74,7 @@ pub fn parse_ws_message(msg: &str, chan_map: &HashMap<u64, String>) -> WsEvent {
         }
         
         if let Some(ticker_arr) = arr[1].as_array() {
-            let raw: Option<Vec<f64>> = ticker_arr.iter().map(|v| v.as_f64()).collect();
+            let raw: Option<Vec<f64>> = ticker_arr.iter().take(10).map(|v| v.as_f64()).collect();
             match raw {
                 None => {}
                 Some(raw) => {
