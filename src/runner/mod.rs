@@ -466,17 +466,7 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
     state.last_bid = market_data.bid;
     state.last_ask = market_data.ask;
 
-    crate::logger::log(
-        &format!("RUNNER:{}", state.symbol),
-        &format!(
-            "[{}] last={:.2} bid={:.2} ask={:.2} vol={:.4}",
-            market_data.timestamp.format("%H:%M:%S"),
-            market_data.last_price,
-            market_data.bid,
-            market_data.ask,
-            market_data.volume,
-        ),
-    );
+    crate::logger::update_ticker(state.symbol.clone(), market_data.bid);
 
     let signals = state.algorithm.on_tick(&market_data);
 

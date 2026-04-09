@@ -12,6 +12,7 @@ struct LogState {
 
 static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
+static TICKER_TX: OnceLock<Sender<(String, f64)>> = OnceLock::new();
 
 fn logs_dir() -> PathBuf {
     crate::storage::data_dir().join("logs")
@@ -77,6 +78,16 @@ pub fn init(tx: Sender<String>, retention: u32) -> io::Result<()> {
         .map_err(|_| io::Error::other("Logger already initialised"))?;
     let _ = LOG_TX.set(tx);
     Ok(())
+}
+
+pub fn init_ticker(tx: Sender<(String, f64)>) {
+    let _ = TICKER_TX.set(tx);
+}
+
+pub fn update_ticker(symbol: String, bid: f64) {
+    if let Some(tx) = TICKER_TX.get() {
+        let _ = tx.try_send((symbol, bid));
+    }
 }
 
 pub fn log(source: &str, msg: &str) {

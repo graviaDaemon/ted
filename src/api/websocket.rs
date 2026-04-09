@@ -76,9 +76,7 @@ pub fn parse_ws_message(msg: &str, chan_map: &HashMap<u64, String>) -> WsEvent {
         if let Some(ticker_arr) = arr[1].as_array() {
             let raw: Option<Vec<f64>> = ticker_arr.iter().map(|v| v.as_f64()).collect();
             match raw {
-                None => {
-                    crate::logger::log("[WS]", "Ticker array contained non-numeric field — skipping.");
-                }
+                None => {}
                 Some(raw) => {
                     if let Some(symbol) = chan_map.get(&chan_id) {
                         match parse_ticker(symbol, &raw) {

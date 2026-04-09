@@ -1,18 +1,18 @@
-use std::io::{self, Write};
 use crossterm::{
     cursor,
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    queue,
-    terminal,
+    queue, terminal,
 };
+use std::collections::HashMap;
+use std::io::{self, Write};
 
 pub struct Tui {
     input_buf: String,
     cursor_pos: usize,
     prompt: &'static str,
     log_lines: Vec<String>,
+    ticker_bids: HashMap<String, f64>,
 }
-
 
 impl Tui {
     pub fn enter() -> io::Result<Tui> {
@@ -22,9 +22,14 @@ impl Tui {
             cursor_pos: 0,
             prompt: "> ",
             log_lines: Vec::new(),
+            ticker_bids: HashMap::new(),
         };
         let mut out = io::stdout();
-        queue!(out, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
+        queue!(
+            out,
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
         out.flush()?;
         tui.redraw();
         Ok(tui)
@@ -100,35 +105,73 @@ impl Tui {
         None
     }
 
+    pub fn handle_ticker(&mut self, symbol: String, bid: f64) {
+        self.ticker_bids.insert(symbol, bid);
+        let Ok((cols, rows)) = terminal::size() else {
+            return;
+        };
+        if rows < 5 {
+            return;
+        }
+        let cols = cols.min(500) as usize;
+        self.render_ticker_row(cols, rows);
+        let col = (self.prompt.len() + self.cursor_pos).min(cols) as u16;
+        let mut out = io::stdout();
+        let _ = queue!(out, cursor::MoveTo(col, rows - 2));
+        let _ = out.flush();
+    }
+
+    fn render_ticker_row(&self, cols: usize, rows: u16) {
+        let line = if self.ticker_bids.is_empty() {
+            String::new()
+        } else {
+            let mut parts: Vec<String> = self
+                .ticker_bids
+                .iter()
+                .map(|(sym, bid)| format!("{}: {:.6}", sym, bid))
+                .collect();
+            parts.sort();
+            format!("[ {} ]", parts.join(" | "))
+        };
+        let visible: String = line.chars().take(cols).collect();
+        let mut out = io::stdout();
+        let _ = queue!(out, cursor::MoveTo(0, rows - 4));
+        let _ = write!(out, "\x1b[2K{}", visible);
+    }
+
     fn redraw(&self) {
-        let Ok((cols, rows)) = terminal::size() else { return };
-        if rows < 4 {
+        let Ok((cols, rows)) = terminal::size() else {
+            return;
+        };
+        if rows < 5 {
             return;
         }
 
         let cols = cols.min(500) as usize;
         let sep = "─".repeat(cols);
 
-        let log_row_count = (rows - 3) as usize;
+        let log_row_count = (rows - 4) as usize;
         let log_start = self.log_lines.len().saturating_sub(log_row_count);
 
         let mut out = io::stdout();
 
         for row in 0..log_row_count {
             let _ = queue!(out, cursor::MoveTo(0, row as u16));
-            let _ = write!(out, "\x1b[2K"); // erase full line
+            let _ = write!(out, "\x1b[2K");
             if let Some(line) = self.log_lines.get(log_start + row) {
                 let visible: String = line.chars().take(cols).collect();
                 let _ = write!(out, "{}", visible);
             }
         }
-        
+
+        self.render_ticker_row(cols, rows);
+
         let _ = queue!(out, cursor::MoveTo(0, rows - 3));
         let _ = write!(out, "{}", sep);
-        
+
         let _ = queue!(out, cursor::MoveTo(0, rows - 2));
         let _ = write!(out, "\x1b[2K{}{}", self.prompt, self.input_buf);
-        
+
         let _ = queue!(out, cursor::MoveTo(0, rows - 1));
         let _ = write!(out, "{}", sep);
 
@@ -139,7 +182,9 @@ impl Tui {
     }
 
     fn redraw_input(&self) {
-        let Ok((cols, rows)) = terminal::size() else { return };
+        let Ok((cols, rows)) = terminal::size() else {
+            return;
+        };
         if rows < 4 {
             return;
         }
@@ -153,7 +198,9 @@ impl Tui {
     }
 
     fn reposition_cursor(&self) {
-        let Ok((cols, rows)) = terminal::size() else { return };
+        let Ok((cols, rows)) = terminal::size() else {
+            return;
+        };
         if rows < 4 {
             return;
         }

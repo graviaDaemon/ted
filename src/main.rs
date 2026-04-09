@@ -27,6 +27,7 @@ use tokio::time::timeout;
 #[tokio::main]
 async fn main() {
     let (log_tx, mut log_rx) = channel::<String>(256);
+    let (ticker_tx, mut ticker_rx) = channel::<(String, f64)>(64);
 
     let config = Config::load_config("config.json").expect("Failed to load config.json");
     if let Err(e) = &config.validate() {
@@ -35,6 +36,7 @@ async fn main() {
     }
 
     crate::storage::data_dir();
+    logger::init_ticker(ticker_tx);
     if let Err(e) = logger::init(log_tx, config.startup_defaults.log_retention) {
         eprintln!("Warning: could not initialise log file: {}", e);
     }
@@ -102,6 +104,12 @@ async fn main() {
             msg = log_rx.recv() => {
                 if let Some(line) = msg {
                     tui.handle_log(&line);
+                }
+            }
+
+            msg = ticker_rx.recv() => {
+                if let Some((symbol, bid)) = msg {
+                    tui.handle_ticker(symbol, bid);
                 }
             }
         }
