@@ -206,7 +206,7 @@ impl Algorithm for GridBot {
     }
 
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal> {
-        let price = tick.last_price;
+        let price = (tick.bid + tick.ask) / 2.0;
 
         if self.last_price.is_none() {
             if !self.buy_orders.is_empty() || !self.sell_orders.is_empty() {
