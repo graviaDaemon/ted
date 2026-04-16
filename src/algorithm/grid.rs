@@ -1,6 +1,6 @@
 use crate::algorithm::Algorithm;
 use crate::api::{MarketData, TradeSignal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct GridBot {
     levels_per_side: u32,
@@ -22,6 +22,9 @@ pub struct GridBot {
     realized_pnl: f64,
     total_buys: u32,
     total_sells: u32,
+
+    emitted_buy_prices: HashSet<u64>,
+    emitted_sell_prices: HashSet<u64>,
 }
 
 impl GridBot {
@@ -89,6 +92,8 @@ impl GridBot {
             realized_pnl: 0.0,
             total_buys: 0,
             total_sells: 0,
+            emitted_buy_prices: HashSet::new(),
+            emitted_sell_prices: HashSet::new(),
         })
     }
 
@@ -120,6 +125,8 @@ impl GridBot {
 
         self.buy_orders.clear();
         self.sell_orders.clear();
+        self.emitted_buy_prices.clear();
+        self.emitted_sell_prices.clear();
 
         for i in 0..self.levels_per_side {
             let price = ((midpoint - (i as f64 + 1.0) * self.spacing) * m).round() / m;
@@ -268,11 +275,11 @@ impl Algorithm for GridBot {
             let triggered: Vec<(u64, f64)> = self
                 .sell_orders
                 .iter()
-                .filter(|&(_, &v)| v <= price)
+                .filter(|&(k, &v)| v <= price && !self.emitted_sell_prices.contains(k))
                 .map(|(&k, &v)| (k, v))
                 .collect();
             for (key, sell_price) in triggered {
-                self.sell_orders.remove(&key);
+                self.emitted_sell_prices.insert(key);
                 signals.push(TradeSignal::Sell {
                     price: sell_price,
                     quantity: self.qty,
@@ -284,11 +291,11 @@ impl Algorithm for GridBot {
             let triggered: Vec<(u64, f64)> = self
                 .buy_orders
                 .iter()
-                .filter(|&(_, &v)| v >= price)
+                .filter(|&(k, &v)| v >= price && !self.emitted_buy_prices.contains(k))
                 .map(|(&k, &v)| (k, v))
                 .collect();
             for (key, buy_price) in triggered {
-                self.buy_orders.remove(&key);
+                self.emitted_buy_prices.insert(key);
                 signals.push(TradeSignal::Buy {
                     price: buy_price,
                     quantity: self.qty,
@@ -314,6 +321,7 @@ impl Algorithm for GridBot {
 
         if is_buy {
             self.buy_orders.remove(&self.price_key(fill_price));
+            self.emitted_buy_prices.remove(&self.price_key(fill_price));
             self.position += self.qty;
             self.total_buys += 1;
 
@@ -369,6 +377,7 @@ impl Algorithm for GridBot {
             }
         } else {
             self.sell_orders.remove(&self.price_key(fill_price));
+            self.emitted_sell_prices.remove(&self.price_key(fill_price));
             self.position -= self.qty;
             self.total_sells += 1;
             self.realized_pnl += self.spacing * self.qty;
@@ -440,9 +449,9 @@ impl Algorithm for GridBot {
 
     fn on_order_failed(&mut self, price: f64, is_buy: bool) {
         if is_buy {
-            self.buy_orders.remove(&self.price_key(price));
+            self.emitted_buy_prices.remove(&self.price_key(price));
         } else {
-            self.sell_orders.remove(&self.price_key(price));
+            self.emitted_sell_prices.remove(&self.price_key(price));
         }
     }
 
@@ -458,6 +467,8 @@ impl Algorithm for GridBot {
 
     fn on_reconnect(&mut self) {
         self.last_price = None;
+        self.emitted_buy_prices.clear();
+        self.emitted_sell_prices.clear();
         if self.buy_orders.is_empty() && self.sell_orders.is_empty() {
             crate::logger::log(
                 "[GRID]",

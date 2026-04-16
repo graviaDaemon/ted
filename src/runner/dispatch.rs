@@ -56,7 +56,7 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
             TradeSignal::Buy { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT BUY {:.8} @ {:.2} — {}", quantity, price, reason));
-                    let _ = state.algorithm.on_fill(*price, true, *price);
+                    let _fill_signals = state.algorithm.on_fill(*price, true, *price);
                     state.write_fill_to_db(None, true, *price, *quantity);
                 } else {
                     let (_, quote) = extract_currencies(&state.symbol);
@@ -95,7 +95,7 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
             TradeSignal::Sell { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT SELL {:.8} @ {:.2} — {}", quantity, price, reason));
-                    let _ = state.algorithm.on_fill(*price, false, *price);
+                    let _fill_signals = state.algorithm.on_fill(*price, false, *price);
                     state.write_fill_to_db(None, false, *price, *quantity);
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);

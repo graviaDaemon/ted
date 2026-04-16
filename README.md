@@ -6,7 +6,7 @@ DISCLAIMER: AI has been used as a tool to fix some bugs, streamline data-flow, a
 
 ---
 
-![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-2.0.0-green)
+![Static Badge](https://img.shields.io/badge/T.E.D_--_Trading_Exchange_Driver-2.2.9-green)
 
 A Rust-based algorithmic trading daemon for the Bitfinex exchange. Connects to the Bitfinex WebSocket v2 API, streams live market data, and executes configurable trading strategies.
 
@@ -111,9 +111,9 @@ runner -s BTCUSD --kill           # stop runner and cancel any open orders
 runner -s BTCUSD --configure grid --option levels=5 qty=0.002 atr_period=14
 ```
 
-There are three modes:
-- **simulation** — no API calls; fills are simulated immediately on signal. The default when paper credentials are absent or `startup_defaults.paper` is `false`.
-- **live** — places and tracks real orders against the live account.
+There are two modes:
+- **simulation** — no API calls; fills are simulated immediately on signal. Deprecated — use paper-trading API credentials instead for accurate testing.
+- **live** — places and tracks real orders against the exchange account.
 
 ---
 
@@ -155,6 +155,8 @@ runner -s BTCUSD --algorithm passive
 ### Built-in: `grid`
 
 Places limit buy and sell orders at equidistant price levels. The grid is centred on the live price at the moment the first tick arrives. In paper/live mode, the initial grid size is constrained by available wallet balance.
+
+The grid slides with price: when a buy fills, a counter sell is placed near the current price and a new buy is added below the lowest remaining buy, maintaining exactly `levels` orders on each side. The inverse applies when a sell fills. This allows the grid to walk indefinitely with a trending market without exhausting either side.
 
 **Dynamic spacing via ATR**: when `atr_period` is supplied, spacing is derived from the Average True Range of recent candles (`spacing = ATR × atr_multiplier`). This makes the grid adapt to current market volatility. ATR is refreshed periodically based on `startup_defaults.atr_refresh_mins`.
 
