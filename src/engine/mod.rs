@@ -1,19 +1,16 @@
 pub mod channels;
 
 use std::collections::HashMap;
-use tokio::net::TcpStream;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout, Duration};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 
-use crate::api::candles::{fetch_candles, Candle};
-use crate::api::endpoints::{cancel_order, fetch_open_orders, fetch_order_history, place_order};
+use crate::api::candles::Candle;
 use crate::api::types::{OrderResult, TradeSignal};
-use crate::api::websocket::{connect_authenticated, parse_auth_ws_message, parse_ws_message};
 use crate::api::WsEvent;
-use crate::config::config::Config;
+use crate::exchange::{Exchange, WsStream};
 use channels::{EngineEvent, EngineRequest};
 
 #[derive(Clone)]
@@ -61,11 +58,11 @@ impl EngineHandle {
     }
 }
 
-pub fn spawn_engine(config: Config) -> (EngineHandle, tokio::task::JoinHandle<()>) {
+pub fn spawn_engine(exchange: Arc<dyn Exchange>) -> (EngineHandle, tokio::task::JoinHandle<()>) {
     let (req_tx, req_rx) = mpsc::channel::<EngineRequest>(256);
     let handle = EngineHandle { request_tx: req_tx };
     let join = tokio::spawn(async move {
-        Engine::run(config, req_rx).await;
+        Engine::run(exchange, req_rx).await;
     });
     (handle, join)
 }
@@ -78,63 +75,48 @@ enum RestJob {
     FetchCandles { symbol: String, timeframe: String, period: usize, reply: oneshot::Sender<Result<Vec<Candle>, String>> },
 }
 
-async fn rest_worker(config: Config, http_client: reqwest::Client, mut rest_rx: mpsc::Receiver<RestJob>) {
+async fn rest_worker(exchange: Arc<dyn Exchange>, mut rest_rx: mpsc::Receiver<RestJob>) {
     while let Some(job) = rest_rx.recv().await {
         match job {
             RestJob::PlaceOrder { signal, symbol, reply } => {
-                let result = place_order(&signal, &symbol, &config, &http_client)
-                    .await.map_err(|e| e.to_string());
-                let _ = reply.send(result);
+                let _ = reply.send(exchange.place_order(&signal, &symbol).await);
             }
             RestJob::CancelOrder { order_id, reply } => {
-                let result = cancel_order(order_id, &config, &http_client)
-                    .await.map_err(|e| e.to_string());
-                let _ = reply.send(result);
+                let _ = reply.send(exchange.cancel_order(order_id).await);
             }
             RestJob::FetchOrders { symbol, reply } => {
-                let result = fetch_open_orders(&symbol, &config, &http_client)
-                    .await.map_err(|e| e.to_string());
-                let _ = reply.send(result);
+                let _ = reply.send(exchange.fetch_open_orders(&symbol).await);
             }
             RestJob::FetchHistory { symbol, reply } => {
-                let result = fetch_order_history(&symbol, &config, &http_client)
-                    .await.map_err(|e| e.to_string());
-                let _ = reply.send(result);
+                let _ = reply.send(exchange.fetch_order_history(&symbol).await);
             }
             RestJob::FetchCandles { symbol, timeframe, period, reply } => {
-                let result = fetch_candles(&symbol, &timeframe, period, &config, &http_client)
-                    .await.map_err(|e| e.to_string());
-                let _ = reply.send(result);
+                let _ = reply.send(exchange.fetch_candles(&symbol, &timeframe, period).await);
             }
         }
     }
 }
 
 struct Engine {
-    config: Config,
+    exchange: Arc<dyn Exchange>,
     request_rx: mpsc::Receiver<EngineRequest>,
     rest_tx: mpsc::Sender<RestJob>,
-    pub_ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    pub_ws: WsStream,
     chan_map: HashMap<u64, String>,
     subscribers: HashMap<String, mpsc::Sender<EngineEvent>>,
-    auth_ws: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    auth_ws: Option<WsStream>,
     auth_subscribers: Vec<mpsc::Sender<EngineEvent>>,
     last_wallet_snapshot: Option<Vec<(String, String, f64)>>,
 }
 
 impl Engine {
-    async fn run(config: Config, request_rx: mpsc::Receiver<EngineRequest>) {
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-
+    async fn run(exchange: Arc<dyn Exchange>, request_rx: mpsc::Receiver<EngineRequest>) {
         let (rest_tx, rest_rx) = mpsc::channel::<RestJob>(128);
-        tokio::spawn(rest_worker(config.clone(), http_client, rest_rx));
+        tokio::spawn(rest_worker(exchange.clone(), rest_rx));
 
-        let auth_ws = connect_authenticated(&config).await.ok();
+        let auth_ws = exchange.connect_auth().await.ok();
 
-        let pub_ws = match connect_pub_ws(&config).await {
+        let pub_ws = match connect_pub_ws(exchange.as_ref()).await {
             Some(ws) => ws,
             None => {
                 crate::logger::log("[ENGINE]", "Initial public WS connection failed — engine exiting.");
@@ -143,7 +125,7 @@ impl Engine {
         };
 
         let mut engine = Engine {
-            config,
+            exchange,
             request_rx,
             rest_tx,
             pub_ws,
@@ -174,7 +156,7 @@ impl Engine {
                     match ws_result {
                         Err(_) => self.reconnect_pub_ws().await,
                         Ok(Some(Ok(Message::Text(text)))) => {
-                            let event = parse_ws_message(&text, &self.chan_map);
+                            let event = self.exchange.parse_public(&text, &self.chan_map);
                             self.route_pub_event(event).await;
                         }
                         Ok(Some(Ok(Message::Ping(p)))) => {
@@ -188,7 +170,7 @@ impl Engine {
                 auth_msg = Self::next_auth(&mut self.auth_ws) => {
                     match auth_msg {
                         Some(Ok(Message::Text(text))) => {
-                            let event = parse_auth_ws_message(&text);
+                            let event = self.exchange.parse_auth(&text);
                             self.broadcast_auth_event(event).await;
                         }
                         Some(Ok(Message::Ping(p))) => {
@@ -208,12 +190,8 @@ impl Engine {
         match req {
             EngineRequest::Subscribe { symbol, event_tx } => {
                 if !self.subscribers.contains_key(&symbol) {
-                    let sub_msg = serde_json::json!({
-                        "event": "subscribe",
-                        "channel": "ticker",
-                        "symbol": format!("t{}", symbol)
-                    });
-                    let _ = self.pub_ws.send(Message::Text(sub_msg.to_string().into())).await;
+                    let sub_msg = self.exchange.subscribe_frame(&symbol);
+                    let _ = self.pub_ws.send(Message::Text(sub_msg.into())).await;
                 }
                 if let Some(balances) = &self.last_wallet_snapshot {
                     let _ = event_tx.send(EngineEvent::WalletSnapshot { balances: balances.clone() }).await;
@@ -226,12 +204,8 @@ impl Engine {
             }
             EngineRequest::Unsubscribe { symbol } => {
                 if self.subscribers.remove(&symbol).is_some() {
-                    let unsub_msg = serde_json::json!({
-                        "event": "unsubscribe",
-                        "channel": "ticker",
-                        "symbol": format!("t{}", symbol)
-                    });
-                    let _ = self.pub_ws.send(Message::Text(unsub_msg.to_string().into())).await;
+                    let unsub_msg = self.exchange.unsubscribe_frame(&symbol);
+                    let _ = self.pub_ws.send(Message::Text(unsub_msg.into())).await;
                 }
             }
             EngineRequest::PlaceOrder { signal, symbol, reply } => {
@@ -317,15 +291,12 @@ impl Engine {
         for attempt in 1..=MAX_ATTEMPTS {
             let delay = (2u64.pow(attempt - 1)).min(60);
             sleep(Duration::from_secs(delay)).await;
-            if let Some(ws) = connect_pub_ws(&self.config).await {
+            if let Some(ws) = connect_pub_ws(self.exchange.as_ref()).await {
                 self.pub_ws = ws;
-                for symbol in self.subscribers.keys() {
-                    let sub_msg = serde_json::json!({
-                        "event": "subscribe",
-                        "channel": "ticker",
-                        "symbol": format!("t{}", symbol)
-                    });
-                    let _ = self.pub_ws.send(Message::Text(sub_msg.to_string().into())).await;
+                let symbols: Vec<String> = self.subscribers.keys().cloned().collect();
+                for symbol in &symbols {
+                    let sub_msg = self.exchange.subscribe_frame(symbol);
+                    let _ = self.pub_ws.send(Message::Text(sub_msg.into())).await;
                 }
                 self.broadcast_all(EngineEvent::PublicWsReconnected).await;
                 crate::logger::log("[ENGINE]", "Public WS reconnected.");
@@ -346,7 +317,7 @@ impl Engine {
         for attempt in 1..=MAX_ATTEMPTS {
             let delay = (2u64.pow(attempt - 1)).min(30);
             sleep(Duration::from_secs(delay)).await;
-            match connect_authenticated(&self.config).await {
+            match self.exchange.connect_auth().await {
                 Ok(ws) => {
                     self.auth_ws = Some(ws);
                     crate::logger::log("[ENGINE]", "Auth WS reconnected.");
@@ -364,7 +335,7 @@ impl Engine {
     }
 
     async fn next_auth(
-        auth_ws: &mut Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        auth_ws: &mut Option<WsStream>,
     ) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
         match auth_ws {
             Some(ws) => ws.next().await,
@@ -373,9 +344,9 @@ impl Engine {
     }
 }
 
-async fn connect_pub_ws(config: &Config) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    match tokio_tungstenite::connect_async(config.api.ws_endpoint.as_str()).await {
-        Ok((ws, _)) => Some(ws),
+async fn connect_pub_ws(exchange: &dyn Exchange) -> Option<WsStream> {
+    match exchange.connect_public().await {
+        Ok(ws) => Some(ws),
         Err(e) => {
             crate::logger::log("[ENGINE]", &format!("Public WS connect failed: {}", e));
             None

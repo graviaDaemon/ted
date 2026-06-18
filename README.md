@@ -32,36 +32,54 @@ Copy `config.template.json` to `config.json` and fill in your credentials:
     "ws_endpoint":      "wss://api-pub.bitfinex.com/ws/2",
     "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2",
     "key": "YOUR_API_KEY",
-    "secret": "YOUR_API_SECRET"
+    "secret": "YOUR_API_SECRET",
+    "paper_key": "YOUR_PAPER_API_KEY",
+    "paper_secret": "YOUR_PAPER_API_SECRET"
   },
   "startup_defaults": {
-    "throttle_ms":      300,
-    "log_retention":    7,
-    "atr_refresh_mins": 60
+    "throttle_ms":             300,
+    "log_retention":           7,
+    "atr_refresh_mins":        60,
+    "log_level":               "info",
+    "snapshot_retention_days": 30,
+    "default_maker_fee":       0.0,
+    "default_taker_fee":       0.0,
+    "paper":                   false
   }
 }
 ```
 
-| Field                               | Description                                                                                         |
-|-------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `api.auth_endpoint`                 | Base URL for authenticated REST calls                                                               |
-| `api.pub_endpoint`                  | Base URL for public REST calls (candle fetches)                                                     |
-| `api.ws_endpoint`                   | Public WebSocket endpoint (ticker streaming)                                                        |
-| `api.auth_ws_endpoint`              | Authenticated WebSocket endpoint (order events)                                                     |
-| `api.key/secret`                    | API key and secret for your live Bitfinex account. This can be the paper-trading api or regular api |
-| `startup_defaults.throttle_ms`      | Minimum milliseconds between ticks processed                                                        |
-| `startup_defaults.log_retention`    | Days of log files to keep                                                                           |
-| `startup_defaults.atr_refresh_mins` | How often (in minutes) to refetch ATR for dynamic grid spacing                                      |
+| Field                                       | Description                                                                                         |
+|---------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `api.auth_endpoint`                         | Base URL for authenticated REST calls                                                               |
+| `api.pub_endpoint`                          | Base URL for public REST calls (candle fetches)                                                     |
+| `api.ws_endpoint`                           | Public WebSocket endpoint (ticker streaming)                                                        |
+| `api.auth_ws_endpoint`                      | Authenticated WebSocket endpoint (order events)                                                     |
+| `api.key/secret`                            | API key and secret for your live Bitfinex account                                                   |
+| `api.paper_key/paper_secret`                | API key and secret for your paper-trading sub-account (optional; falls back to the live pair)       |
+| `startup_defaults.throttle_ms`              | Minimum milliseconds between ticks processed                                                        |
+| `startup_defaults.log_retention`            | Days of log files to keep                                                                           |
+| `startup_defaults.atr_refresh_mins`         | How often (in minutes) to refetch ATR for dynamic grid spacing                                      |
+| `startup_defaults.log_level`                | Minimum log severity to emit: `trace`/`debug`/`info`/`warn`/`error`/`critical` (default `info`)     |
+| `startup_defaults.snapshot_retention_days`  | Days of high-frequency per-runner snapshots to retain; older rows are pruned at startup             |
+| `startup_defaults.snapshot_interval_secs`   | Seconds between per-runner snapshot samples (default 60; skipped in simulation mode)                |
+| `startup_defaults.default_maker_fee`        | Fallback maker fee (fraction, e.g. `0.001`) when a runner doesn't pass a `maker_fee` option         |
+| `startup_defaults.default_taker_fee`        | Fallback taker fee (fraction) when a runner doesn't pass a `taker_fee` option                       |
+| `startup_defaults.paper`                    | Start runners in paper mode by default, and route the engine to paper credentials                   |
 
 ### Setting up paper trading credentials
 
 1. Log into your Bitfinex account
 2. Go to **Account → Paper Trading** and enable the paper trading sub-account
 3. Generate an API key specifically for the paper account (separate from your live key/secret)
-4. Fill `credentials.paper_key` and `credentials.paper_secret` with those values
-5. Set `startup_defaults.paper: true` to start runners in paper mode by default, or pass `--paper` at runtime
+4. Fill `api.paper_key` and `api.paper_secret` with those values
+5. Set `startup_defaults.paper: true` to start runners in paper mode by default, or pass `--paper` when spawning a runner
 
-Paper mode uses the same Bitfinex endpoints as live trading — only the credentials differ. If paper credentials are absent, the runner refuses to start rather than silently falling back to simulation.
+Paper mode uses the same Bitfinex endpoints as live trading — only the credentials differ.
+
+**Credential routing is process-wide.** The engine is spawned once at startup and selects live vs. paper credentials from `startup_defaults.paper` alone. The per-runner `--paper`/`--live` flags choose a runner's *mode* (which order path it uses), but every runner shares the engine's single credential set. To trade against paper credentials, set `startup_defaults.paper: true`. If paper credentials are absent while paper mode is active, the engine falls back to the live key/secret and logs a one-time warning. (Per-runner credential isolation across different accounts is deferred to the exchange-trait work.)
+
+Per-runner trading fees can be supplied as options: `runner -s BTCUSD -a grid -o maker_fee=0.001 taker_fee=0.002`. When omitted, the `startup_defaults.default_*_fee` values apply.
 
 ---
 
@@ -103,8 +121,17 @@ runner [-s, --symbol] LTCUSD [-a, --algorithm] grid [-o, --option] levels=5 qty=
 ```
 runner -s BTCUSD --pause          # pause tick processing (WS stays connected)
 runner -s BTCUSD --resume         # resume
-runner -s BTCUSD --kill           # stop runner and cancel any open orders
+runner -s BTCUSD --kill           # stop runner, cancel open orders, forget saved state
+runner -s BTCUSD -a grid --fresh  # spawn ignoring any saved resume state
 ```
+
+**Resume:** a running runner persists its strategy state and pending orders to
+`runner_state` in the database. On a clean app exit (or a crash), resting orders
+are left in place and the state is saved; spawning the same symbol+algorithm again
+restores that state and reconciles the restored orders against the exchange's
+actual open orders, picking up where it left off. An explicit `--kill` cancels the
+orders and clears the saved state so the runner does not auto-resume. Pass `--fresh`
+to start a clean grid regardless of any saved state.
 
 **Switch algorithm on a running runner:**
 ```
@@ -138,7 +165,10 @@ Output files are written to the current directory (`overview_BTCUSD_2026-03-22.m
 exit
 ```
 
-Gracefully stops all runners (cancels open orders), closes WebSocket connections, and exits.
+Gracefully stops all runners, closes WebSocket connections, and exits. Resting orders
+are **left in place** and each runner's state is saved so spawning the same symbol on
+the next launch resumes where it left off. Use `runner -s <SYMBOL> --kill` first if you
+want a runner's orders cancelled and its saved state cleared instead.
 
 ---
 
@@ -283,7 +313,7 @@ Data and logs are written to the platform data directory, not the working direct
 
 ```
 <data dir>/ted/
-├── ted.db               # SQLite database (runners, ticks, orders, fills)
+├── ted.db               # SQLite database (runners, fills, snapshots, daily_rollups, runner_state)
 ├── logs/
 │   ├── ted.log          # current log file
 │   └── ted_2026-03-22.log  # rotated logs (kept for log_retention days)

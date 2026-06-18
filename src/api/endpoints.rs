@@ -36,12 +36,12 @@ pub async fn place_order(
     let mut last_text   = String::new();
     'retry: for attempt in 1..=MAX_ATTEMPTS {
         let nonce = Utc::now().timestamp_millis().to_string();
-        let sig   = sign_rest_request(config.active_secret(), path, &nonce, &body);
+        let sig   = sign_rest_request(config.active_secret(config.credential_mode), path, &nonce, &body);
         let response = client
             .post(&url)
             .header("Content-Type",  "application/json")
             .header("bfx-nonce",     &nonce)
-            .header("bfx-apikey",    config.active_key())
+            .header("bfx-apikey",    config.active_key(config.credential_mode))
             .header("bfx-signature", &sig)
             .body(body.clone())
             .send()
@@ -100,14 +100,14 @@ pub async fn fetch_open_orders(
     let path  = format!("/v2/auth/r/orders/t{}", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
-    let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(config.credential_mode), &path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.active_key())
+        .header("bfx-apikey",    config.active_key(config.credential_mode))
         .header("bfx-signature", &sig)
         .body(body)
         .send()
@@ -141,14 +141,14 @@ pub async fn fetch_order_history(
     let path  = format!("/v2/auth/r/orders/t{}/hist", symbol);
     let nonce = chrono::Utc::now().timestamp_millis().to_string();
     let body  = String::new();
-    let sig   = sign_rest_request(config.active_secret(), &path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(config.credential_mode), &path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.active_key())
+        .header("bfx-apikey",    config.active_key(config.credential_mode))
         .header("bfx-signature", &sig)
         .body(body)
         .send()
@@ -187,14 +187,14 @@ pub async fn cancel_order(
     let path  = "/v2/auth/w/order/cancel";
     let nonce = Utc::now().timestamp_millis().to_string();
     let body  = serde_json::json!({ "id": order_id }).to_string();
-    let sig   = sign_rest_request(config.active_secret(), path, &nonce, &body);
+    let sig   = sign_rest_request(config.active_secret(config.credential_mode), path, &nonce, &body);
     let url   = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
 
     let response = client
         .post(&url)
         .header("Content-Type",  "application/json")
         .header("bfx-nonce",     &nonce)
-        .header("bfx-apikey",    config.active_key())
+        .header("bfx-apikey",    config.active_key(config.credential_mode))
         .header("bfx-signature", &sig)
         .body(body)
         .send()

@@ -19,6 +19,9 @@ async fn throttle_order(last_order_time: &mut Option<Instant>, throttle_ms: u64)
 }
 
 pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], engine: &EngineHandle) {
+    if state.halted {
+        return;
+    }
     for sig in signals {
         let src = format!("RUNNER:{}", state.symbol);
         match sig {
@@ -56,8 +59,10 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
             TradeSignal::Buy { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT BUY {:.8} @ {:.2} — {}", quantity, price, reason));
+                    let before = state.algorithm.realized_pnl();
                     let _fill_signals = state.algorithm.on_fill(*price, true, *price);
-                    state.write_fill_to_db(None, true, *price, *quantity);
+                    let realized = state.algorithm.realized_pnl() - before;
+                    state.write_fill_to_db(None, true, *price, *quantity, Some(realized));
                 } else {
                     let (_, quote) = extract_currencies(&state.symbol);
                     if !state.wallet_balances.is_empty() && !quote.is_empty()
@@ -95,8 +100,10 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
             TradeSignal::Sell { price, quantity, reason, .. } => {
                 if state.mode == RunnerMode::Simulation {
                     crate::logger::log(&src, &format!("[SIM] LIMIT SELL {:.8} @ {:.2} — {}", quantity, price, reason));
+                    let before = state.algorithm.realized_pnl();
                     let _fill_signals = state.algorithm.on_fill(*price, false, *price);
-                    state.write_fill_to_db(None, false, *price, *quantity);
+                    let realized = state.algorithm.realized_pnl() - before;
+                    state.write_fill_to_db(None, false, *price, *quantity, Some(realized));
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);
                     if !state.wallet_balances.is_empty() && !base.is_empty()

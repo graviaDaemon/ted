@@ -3,6 +3,7 @@ pub mod passive;
 pub mod grid;
 pub mod script;
 pub mod atr;
+pub mod position;
 pub use traits::*;
 pub use passive::*;
 pub use grid::*;

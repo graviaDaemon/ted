@@ -5,11 +5,19 @@
     "ws_endpoint":      "wss://api-pub.bitfinex.com/ws/2",
     "auth_ws_endpoint": "wss://api.bitfinex.com/ws/2",
     "key": "",
-    "secret": ""
+    "secret": "",
+    "paper_key": "",
+    "paper_secret": ""
   },
   "startup_defaults": {
-    "throttle_ms":      300,
-    "log_retention":    7,
-    "atr_refresh_mins": 60
+    "throttle_ms":             300,
+    "log_retention":           7,
+    "atr_refresh_mins":        60,
+    "log_level":               "info",
+    "snapshot_retention_days": 30,
+    "snapshot_interval_secs":  60,
+    "default_maker_fee":       0.0,
+    "default_taker_fee":       0.0,
+    "paper":                   false
   }
 }

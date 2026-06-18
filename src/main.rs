@@ -2,18 +2,24 @@ mod commands;
 mod config;
 mod api;
 mod algorithm;
+mod backtest;
 mod runner;
 mod storage;
 mod logger;
 mod tui;
 mod util;
 mod engine;
+mod exchange;
 
-use crate::config::config::Config;
+use crate::config::config::{Config, CredentialMode};
 use crate::config::channels::{RunnerControl, RunnerMode};
+use crate::logger::LogLevel;
 use crate::commands::cli::{Cli, CliAction};
 use crate::engine::spawn_engine;
+use crate::exchange::Exchange;
+use crate::exchange::bitfinex::Bitfinex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
 use crossterm::event::{Event, EventStream};
@@ -29,16 +35,46 @@ async fn main() {
     let (log_tx, mut log_rx) = channel::<String>(256);
     let (ticker_tx, mut ticker_rx) = channel::<(String, f64)>(64);
 
-    let config = Config::load_config("config.json").expect("Failed to load config.json");
+    let mut config = Config::load_config("config.json").expect("Failed to load config.json");
     if let Err(e) = &config.validate() {
         eprintln!("Invalid config.json: {}", e);
         std::process::exit(1);
     }
 
+    // Credential routing is process-wide for this changeset (the engine is
+    // spawned once). Derive it from startup_defaults.paper; per-runner --paper
+    // affects RunnerMode but not which credentials the shared engine uses.
+    config.credential_mode = if config.startup_defaults.paper {
+        CredentialMode::Paper
+    } else {
+        CredentialMode::Live
+    };
+
     crate::storage::data_dir();
     logger::init_ticker(ticker_tx);
-    if let Err(e) = logger::init(log_tx, config.startup_defaults.log_retention) {
+    let min_level = LogLevel::from_str(&config.startup_defaults.log_level);
+    if let Err(e) = logger::init(log_tx, config.startup_defaults.log_retention, min_level) {
         eprintln!("Warning: could not initialise log file: {}", e);
+    }
+
+    // Retention: prune high-frequency snapshots older than the configured cutoff
+    // once at startup. Fills and daily rollups are kept forever.
+    {
+        let db_path = crate::storage::data_dir().join("ted.db");
+        match crate::storage::db::Db::open(&db_path) {
+            Ok(db) => match db.prune_snapshots(config.startup_defaults.snapshot_retention_days) {
+                Ok(0) => {}
+                Ok(n) => logger::log_info(
+                    "[STORE]",
+                    &format!(
+                        "Pruned {} snapshot row(s) older than {} day(s).",
+                        n, config.startup_defaults.snapshot_retention_days
+                    ),
+                ),
+                Err(e) => logger::log_warn("[STORE]", &format!("Snapshot prune failed: {}", e)),
+            },
+            Err(e) => logger::log_warn("[STORE]", &format!("Could not open DB for prune: {}", e)),
+        }
     }
 
     let script_registry = crate::algorithm::script::init_script_registry("algorithms");
@@ -51,7 +87,12 @@ async fn main() {
         }
     }
     tokio::spawn(crate::algorithm::script::watch_algorithms("algorithms", script_registry));
-    let (engine_handle, _engine_join) = spawn_engine(config.clone());
+
+    // Exchange seam: Bitfinex is the sole implementation. A `config.exchange`
+    // field would dispatch to a different `impl Exchange` here later — the
+    // engine, runners, and algorithms would not change.
+    let exchange: Arc<dyn Exchange> = Arc::new(Bitfinex::new(config.clone()));
+    let (engine_handle, _engine_join) = spawn_engine(exchange.clone());
 
     let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
     let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
@@ -88,6 +129,7 @@ async fn main() {
                                     line.trim(),
                                     &config,
                                     &engine_handle,
+                                    &exchange,
                                 ).await
                             {
                                 break;
@@ -123,9 +165,11 @@ async fn graceful_shutdown(
     runner_txs: &mut HashMap<String, Sender<RunnerControl>>,
     runner_handles: &mut HashMap<String, JoinHandle<()>>,
 ) {
+    // Clean app exit: tell runners to persist resume state and leave resting
+    // orders in place (Shutdown), rather than Kill which cancels and forgets.
     let symbols: Vec<String> = runner_txs.keys().cloned().collect();
     for symbol in &symbols {
-        send_control(runner_txs, runner_handles, symbol, RunnerControl::Kill).await;
+        send_control(runner_txs, runner_handles, symbol, RunnerControl::Shutdown).await;
     }
     runner_txs.clear();
     for (_, handle) in runner_handles.drain() {
@@ -158,6 +202,7 @@ async fn dispatch_line(
     line: &str,
     config: &Config,
     engine_handle: &crate::engine::EngineHandle,
+    exchange: &Arc<dyn Exchange>,
 ) -> bool {
     let args: Vec<&str> = std::iter::once("ted")
         .chain(line.split_whitespace())
@@ -165,7 +210,7 @@ async fn dispatch_line(
     match Cli::try_parse_from(args) {
         Ok(cmd) => match cmd.handle_command() {
             Ok(CliAction::Exit) => return true,
-            Ok(action) => dispatch(runner_txs, runner_handles, action, config, engine_handle).await,
+            Ok(action) => dispatch(runner_txs, runner_handles, action, config, engine_handle, exchange).await,
             Err(e) => logger::log("[CTRL]", &format!("Error: {}", e)),
         },
         Err(e) => logger::log("[CTRL]", &format!("{}", e)),
@@ -179,15 +224,18 @@ async fn dispatch(
     action: CliAction,
     config: &Config,
     engine_handle: &crate::engine::EngineHandle,
+    exchange: &Arc<dyn Exchange>,
 ) {
     match action {
-        CliAction::Spawn { symbol, algorithm, options, live } => {
+        CliAction::Spawn { symbol, algorithm, options, live, paper, fresh } => {
             if runner_txs.contains_key(&symbol) {
                 logger::log("[CTRL]", &format!("Runner for '{}' is already running.", symbol));
                 return;
             }
             let mode = if live {
                 RunnerMode::Live
+            } else if paper || config.startup_defaults.paper {
+                RunnerMode::Paper
             } else {
                 RunnerMode::Simulation
             };
@@ -198,7 +246,7 @@ async fn dispatch(
             let eng = engine_handle.clone();
             let mode_label = format!("{:?}", mode).to_lowercase();
             let handle = tokio::spawn(async move {
-                crate::runner::run_runner(sym, algo, options, mode, rx, eng, cfg).await;
+                crate::runner::run_runner(sym, algo, options, mode, rx, eng, cfg, fresh).await;
             });
             runner_txs.insert(symbol.clone(), tx);
             runner_handles.insert(symbol.clone(), handle);
@@ -289,6 +337,83 @@ async fn dispatch(
                 }
             } else {
                 logger::log("[CTRL]", "generate: specify --runner <SYMBOL> or --all");
+            }
+        }
+
+        CliAction::Backtest {
+            symbol,
+            algorithm,
+            options,
+            timeframe,
+            limit,
+            from_file,
+            spread,
+            maker_fee,
+            taker_fee,
+            start_quote,
+            start_base,
+        } => {
+            let algo_name = if algorithm.is_empty() {
+                "passive".to_string()
+            } else {
+                algorithm
+            };
+
+            let candles = if let Some(path) = &from_file {
+                crate::backtest::load_candles_from_file(path)
+            } else {
+                exchange.fetch_candle_history(&symbol, &timeframe, limit).await
+            };
+
+            let candles = match candles {
+                Ok(c) => c,
+                Err(e) => {
+                    logger::log("[BACKTEST]", &format!("Failed to load candles: {}", e));
+                    return;
+                }
+            };
+
+            logger::log(
+                "[BACKTEST]",
+                &format!(
+                    "Loaded {} candles for {} — replaying '{}'…",
+                    candles.len(),
+                    symbol,
+                    algo_name
+                ),
+            );
+
+            let bt_cfg = crate::backtest::BacktestConfig {
+                symbol: symbol.clone(),
+                algorithm: algo_name,
+                options,
+                timeframe,
+                candles_limit: limit,
+                from_file,
+                start_quote_balance: start_quote,
+                start_base_balance: start_base,
+                spread,
+                maker_fee,
+                taker_fee,
+            };
+
+            match crate::backtest::run_backtest(&bt_cfg, &candles) {
+                Ok(report) => {
+                    for line in report.render_console().lines() {
+                        logger::log("[BACKTEST]", line);
+                    }
+                    match crate::backtest::write_report(&report) {
+                        Ok(path) => logger::log(
+                            "[BACKTEST]",
+                            &format!("Report written to {}", path.display()),
+                        ),
+                        Err(e) => logger::log(
+                            "[BACKTEST]",
+                            &format!("Failed to write report: {}", e),
+                        ),
+                    }
+                }
+                Err(e) => logger::log("[BACKTEST]", &format!("Backtest failed: {}", e)),
             }
         }
 

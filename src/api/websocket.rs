@@ -120,10 +120,10 @@ pub async fn connect_authenticated(
     }
     
     let nonce = Utc::now().timestamp_millis().to_string();
-    let sig   = sign_auth_payload(config.active_secret(), &nonce);
+    let sig   = sign_auth_payload(config.active_secret(config.credential_mode), &nonce);
     let auth_msg = json!({
         "event":       "auth",
-        "apiKey":      config.active_key(),
+        "apiKey":      config.active_key(config.credential_mode),
         "authSig":     sig,
         "authNonce":   nonce,
         "authPayload": format!("AUTH{}", nonce),

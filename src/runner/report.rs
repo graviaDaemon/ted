@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub fn build_content(state: &RunnerState, verbose: bool) -> String {
     let mode_str = match state.mode {
         RunnerMode::Simulation => "simulation",
+        RunnerMode::Paper => "**PAPER**",
         RunnerMode::Live => "**LIVE**",
     };
 
@@ -21,6 +22,21 @@ pub fn build_content(state: &RunnerState, verbose: bool) -> String {
     ));
     md.push_str(&format!("| Algorithm | {} |\n", state.algorithm.name()));
     md.push_str(&format!("| Mode | {} |\n", mode_str));
+    md.push_str(&format!(
+        "| Fees | maker {:.6}, taker {:.6} |\n",
+        state.maker_fee, state.taker_fee
+    ));
+    md.push_str(&format!(
+        "| Drawdown halt | {} |\n",
+        match state.max_drawdown_pct {
+            Some(pct) => format!("limit {:.2}%", pct * 100.0),
+            None => "disabled".to_string(),
+        }
+    ));
+    md.push_str(&format!(
+        "| Halted | {} |\n",
+        if state.halted { "**YES**" } else { "no" }
+    ));
     md.push_str(&format!(
         "| Started | {} UTC |\n",
         state.started_at.format("%Y-%m-%d %H:%M:%S")
@@ -67,6 +83,15 @@ pub fn build_content(state: &RunnerState, verbose: bool) -> String {
         });
         md.push_str(&format!("| Price range | {:.2} – {:.2} |\n", lo, hi));
         md.push_str(&format!("| Last price | {:.2} |\n", last_price));
+
+        let position = state.algorithm.position();
+        if position != 0.0 {
+            md.push_str(&format!("| Position | {:.8} (net base qty) |\n", position));
+            md.push_str(&format!(
+                "| Unrealized PnL | {:+.8} (at last price) |\n",
+                state.algorithm.unrealized_pnl(last_price)
+            ));
+        }
 
         let day_entries = state.trade_log.last_24h();
         if day_entries.len() >= 2 {

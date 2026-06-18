@@ -23,6 +23,7 @@ use trade_log::{TradeEntry, TradeLog};
 pub(crate) fn mode_label(mode: &RunnerMode) -> &'static str {
     match mode {
         RunnerMode::Simulation => "simulation",
+        RunnerMode::Paper => "paper",
         RunnerMode::Live => "live",
     }
 }
@@ -104,6 +105,7 @@ pub(crate) async fn cancel_all_live_orders(state: &mut RunnerState, engine: &Eng
     state.pending_sell_orders.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_runner(
     symbol: String,
     algo_name: String,
@@ -112,6 +114,7 @@ pub async fn run_runner(
     mut control_rx: Receiver<RunnerControl>,
     engine: EngineHandle,
     config: Config,
+    fresh: bool,
 ) {
     let src = format!("RUNNER:{}", symbol);
 
@@ -123,6 +126,21 @@ pub async fn run_runner(
             return;
         }
     };
+
+    // Saved resume blob, if any. Only honour it when the requested algorithm and
+    // mode match what was persisted and the user did not pass `--fresh`.
+    let resume_row = match db.load_runner_state(&symbol) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::logger::log(&src, &format!("Could not load saved state: {}", e));
+            None
+        }
+    };
+    let resume = !fresh
+        && resume_row
+            .as_ref()
+            .map(|r| r.algorithm == algo_name && r.mode == mode_label(&mode))
+            .unwrap_or(false);
 
     let started_at = Utc::now();
     let runner_db_id = match db.insert_runner(
@@ -214,6 +232,22 @@ pub async fn run_runner(
             .or_insert_with(|| "1000000.0".to_string());
     }
 
+    let maker_fee = options
+        .get("maker_fee")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(config.startup_defaults.default_maker_fee);
+    let taker_fee = options
+        .get("taker_fee")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(config.startup_defaults.default_taker_fee);
+    options.insert("maker_fee".to_string(), format!("{}", maker_fee));
+    options.insert("taker_fee".to_string(), format!("{}", taker_fee));
+
+    let max_drawdown_pct = options
+        .get("max_drawdown_pct")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0);
+
     let algorithm = match build_algorithm(&algo_name, &options) {
         Ok(a) => a,
         Err(e) => {
@@ -247,6 +281,18 @@ pub async fn run_runner(
             None
         };
 
+    // Periodic high-frequency snapshots feed analytics/the future dashboard.
+    // Skipped in Simulation, which models perfect instant fills and is not a
+    // real time-series worth persisting.
+    let snapshot_secs = config.startup_defaults.snapshot_interval_secs.max(1);
+    let mut snapshot_interval: Option<tokio::time::Interval> = if mode != RunnerMode::Simulation {
+        let mut iv = tokio::time::interval(Duration::from_secs(snapshot_secs));
+        iv.tick().await;
+        Some(iv)
+    } else {
+        None
+    };
+
     let mut state = RunnerState {
         symbol: symbol.clone(),
         algorithm,
@@ -276,7 +322,58 @@ pub async fn run_runner(
         db: Some(db),
         last_bid: 0.0,
         last_ask: 0.0,
+        maker_fee,
+        taker_fee,
+        max_drawdown_pct,
+        peak_equity: 0.0,
+        halted: false,
+        daily: None,
     };
+
+    if resume {
+        if let Some(row) = &resume_row {
+            if let Some(algo_state) = &row.algo_state {
+                state.algorithm.restore_state(algo_state);
+            }
+            if let Ok(buys) =
+                serde_json::from_str::<HashMap<i64, (f64, f64)>>(&row.pending_buys)
+            {
+                state.pending_buy_orders = buys;
+            }
+            if let Ok(sells) =
+                serde_json::from_str::<HashMap<i64, (f64, f64)>>(&row.pending_sells)
+            {
+                state.pending_sell_orders = sells;
+            }
+            state.live_order_ids = state
+                .pending_buy_orders
+                .keys()
+                .chain(state.pending_sell_orders.keys())
+                .copied()
+                .collect();
+            crate::logger::log_info(
+                &src,
+                &format!(
+                    "Resumed from saved state ({} buy / {} sell pending order(s) restored) — will reconcile against the exchange on auth connect.",
+                    state.pending_buy_orders.len(),
+                    state.pending_sell_orders.len()
+                ),
+            );
+        }
+    } else if fresh && resume_row.is_some() {
+        crate::logger::log_info(&src, "--fresh specified — ignoring saved resume state.");
+    } else if let Some(row) = &resume_row {
+        crate::logger::log_info(
+            &src,
+            &format!(
+                "Saved state exists but does not match this spawn (saved {}/{} vs requested {}/{}) — starting fresh.",
+                row.algorithm,
+                row.mode,
+                algo_name,
+                mode_label(&state.mode)
+            ),
+        );
+    }
 
     crate::logger::log(
         &src,
@@ -286,14 +383,28 @@ pub async fn run_runner(
             mode_label(&state.mode)
         ),
     );
+    crate::logger::log_info(
+        &src,
+        &format!(
+            "Fees: maker {:.6}, taker {:.6}",
+            state.maker_fee, state.taker_fee
+        ),
+    );
+    match state.max_drawdown_pct {
+        Some(pct) => crate::logger::log_info(
+            &src,
+            &format!("Risk: max drawdown halt at {:.2}% below peak equity.", pct * 100.0),
+        ),
+        None => crate::logger::log_info(&src, "Risk: max drawdown halt disabled."),
+    }
 
     loop {
         tokio::select! {
             event = event_rx.recv() => {
                 match event {
                     None | Some(EngineEvent::EngineShutdown) => {
-                        crate::logger::log(&src, "Engine shut down — runner exiting.");
-                        cancel_all_live_orders(&mut state, &engine).await;
+                        crate::logger::log(&src, "Engine shut down — saving state for resume, leaving orders resting.");
+                        state.save_state();
                         engine.unsubscribe(symbol.clone()).await;
                         break;
                     }
@@ -329,20 +440,34 @@ pub async fn run_runner(
                         } else {
                             0.0
                         };
+                        // NOTE: snapshot-diff infers a fill purely from an order's
+                        // absence, so an order cancelled out-of-band is booked as a
+                        // phantom fill here. The history-based reconcile path
+                        // (`sync_orders_after_reconnect`, run on AuthConnected) is the
+                        // authoritative reconciler on resume and distinguishes filled
+                        // from cancelled via `fetch_order_history`; this diff stays as a
+                        // best-effort fallback between snapshots.
                         let mut fill_signals = vec![];
                         for (id, price, qty) in &filled_buys {
                             state.live_order_ids.remove(id);
                             state.pending_buy_orders.remove(id);
+                            let before = state.algorithm.realized_pnl();
                             fill_signals.extend(state.algorithm.on_fill(*price, true, current_price));
+                            let realized = state.algorithm.realized_pnl() - before;
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(Some(*id), true, *price, *qty);
+                            state.write_fill_to_db(Some(*id), true, *price, *qty, Some(realized));
                         }
                         for (id, price, qty) in &filled_sells {
                             state.live_order_ids.remove(id);
                             state.pending_sell_orders.remove(id);
+                            let before = state.algorithm.realized_pnl();
                             fill_signals.extend(state.algorithm.on_fill(*price, false, current_price));
+                            let realized = state.algorithm.realized_pnl() - before;
                             crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(Some(*id), false, *price, *qty);
+                            state.write_fill_to_db(Some(*id), false, *price, *qty, Some(realized));
+                        }
+                        if !filled_buys.is_empty() || !filled_sells.is_empty() {
+                            state.save_state();
                         }
                         let stale: Vec<i64> = state.live_order_ids.iter().copied().filter(|id| !snapshot.contains(id)).collect();
                         for id in &stale { state.live_order_ids.remove(id); }
@@ -368,7 +493,7 @@ pub async fn run_runner(
 
                     Some(EngineEvent::AuthConnected) => {
                         crate::logger::log(&src, "Auth WS connected.");
-                        if state.mode == RunnerMode::Live {
+                        if state.mode != RunnerMode::Simulation {
                             reconcile::sync_orders_after_reconnect(&src, &state.symbol.clone(), &mut state, &engine).await;
                         }
                     }
@@ -405,18 +530,36 @@ pub async fn run_runner(
                 }
             }
 
+            _ = async {
+                match snapshot_interval.as_mut() {
+                    Some(iv) => { iv.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                state.persist_periodic();
+                state.save_state();
+            }
+
             ctrl = control_rx.recv() => {
                 match ctrl {
                     None => {
-                        crate::logger::log(&src, "Control channel closed — runner exiting.");
-                        cancel_all_live_orders(&mut state, &engine).await;
+                        crate::logger::log(&src, "Control channel closed — saving state, leaving orders resting.");
+                        state.save_state();
+                        engine.unsubscribe(symbol.clone()).await;
+                        break;
+                    }
+
+                    Some(RunnerControl::Shutdown) => {
+                        crate::logger::log(&src, "Shutdown — saving state for resume, leaving orders resting.");
+                        state.save_state();
                         engine.unsubscribe(symbol.clone()).await;
                         break;
                     }
 
                     Some(RunnerControl::Kill) => {
-                        crate::logger::log(&src, "Kill received — stopping runner.");
+                        crate::logger::log(&src, "Kill received — cancelling orders and clearing resume state.");
                         cancel_all_live_orders(&mut state, &engine).await;
+                        state.clear_state();
                         engine.unsubscribe(symbol.clone()).await;
                         break;
                     }
@@ -428,7 +571,13 @@ pub async fn run_runner(
 
                     Some(RunnerControl::Resume) => {
                         state.paused = false;
-                        crate::logger::log(&src, "Runner resumed.");
+                        if state.halted {
+                            state.halted = false;
+                            state.peak_equity = 0.0;
+                            crate::logger::log(&src, "Runner resumed — drawdown halt cleared, peak equity reset.");
+                        } else {
+                            crate::logger::log(&src, "Runner resumed.");
+                        }
                     }
 
                     Some(RunnerControl::SetAlgorithm { name, options }) => {
@@ -473,6 +622,10 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
 
     crate::logger::update_ticker(state.symbol.clone(), market_data.bid);
 
+    if check_risk(state, engine).await {
+        return;
+    }
+
     let signals = state.algorithm.on_tick(&market_data);
 
     dispatch_signals(state, &signals, engine).await;
@@ -498,6 +651,55 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
     state.trade_log.push(entry);
 }
 
+/// Algorithm-independent drawdown guard. Computes current equity
+/// (quote balance + position marked at mid) each tick, tracks the peak, and if
+/// the relative drawdown exceeds `max_drawdown_pct` halts the runner: cancels
+/// all live orders and stops dispatching new signals until a manual resume.
+/// Returns `true` while the runner is halted.
+async fn check_risk(state: &mut RunnerState, engine: &EngineHandle) -> bool {
+    if state.halted {
+        return true;
+    }
+    let Some(max_dd) = state.max_drawdown_pct else {
+        return false;
+    };
+    let mid = if state.last_bid > 0.0 && state.last_ask > 0.0 {
+        (state.last_bid + state.last_ask) / 2.0
+    } else {
+        return false;
+    };
+
+    let (_, quote) = extract_currencies(&state.symbol);
+    let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
+    let position = state.algorithm.position();
+    let equity = quote_bal + position * mid;
+
+    if equity > state.peak_equity {
+        state.peak_equity = equity;
+    }
+
+    if state.peak_equity > 0.0 {
+        let drawdown = (state.peak_equity - equity) / state.peak_equity;
+        if drawdown > max_dd {
+            state.halted = true;
+            let src = format!("RUNNER:{}", state.symbol);
+            crate::logger::log_critical(
+                &src,
+                &format!(
+                    "MAX DRAWDOWN BREACHED: equity {:.2} is {:.2}% below peak {:.2} (limit {:.2}%). Halting runner — cancelling all live orders. Send resume to continue.",
+                    equity,
+                    drawdown * 100.0,
+                    state.peak_equity,
+                    max_dd * 100.0
+                ),
+            );
+            cancel_all_live_orders(state, engine).await;
+            return true;
+        }
+    }
+    false
+}
+
 async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: i64) {
     let src = format!("RUNNER:{}", state.symbol);
     let current_price = if state.last_bid > 0.0 && state.last_ask > 0.0 {
@@ -507,21 +709,27 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
     };
     let fill_signals = if let Some((price, qty)) = state.pending_buy_orders.remove(&order_id) {
         state.live_order_ids.remove(&order_id);
+        let before = state.algorithm.realized_pnl();
         let sigs = state.algorithm.on_fill(price, true, current_price);
+        let realized = state.algorithm.realized_pnl() - before;
         crate::logger::log(
             &src,
             &format!("Buy order {} filled @ {:.2}.", order_id, price),
         );
-        state.write_fill_to_db(Some(order_id), true, price, qty);
+        state.write_fill_to_db(Some(order_id), true, price, qty, Some(realized));
+        state.save_state();
         sigs
     } else if let Some((price, qty)) = state.pending_sell_orders.remove(&order_id) {
         state.live_order_ids.remove(&order_id);
+        let before = state.algorithm.realized_pnl();
         let sigs = state.algorithm.on_fill(price, false, current_price);
+        let realized = state.algorithm.realized_pnl() - before;
         crate::logger::log(
             &src,
             &format!("Sell order {} filled @ {:.2}.", order_id, price),
         );
-        state.write_fill_to_db(Some(order_id), false, price, qty);
+        state.write_fill_to_db(Some(order_id), false, price, qty, Some(realized));
+        state.save_state();
         sigs
     } else {
         if state.live_order_ids.remove(&order_id) {

@@ -16,6 +16,38 @@ pub trait Algorithm: Send {
     fn summary(&self) -> Option<String> {
         None
     }
+    /// Net base inventory held by the strategy (positive long, negative short).
+    /// Lets the runner compute equity for risk control generically.
+    fn position(&self) -> f64 {
+        0.0
+    }
+    /// Mark-to-market unrealized PnL of the open position at the given mid price.
+    fn unrealized_pnl(&self, _mid: f64) -> f64 {
+        0.0
+    }
+    /// Lifetime realized PnL booked by the strategy (net of fees where the
+    /// strategy accounts for them). Lets the runner record per-fill realized PnL
+    /// and daily rollups generically.
+    fn realized_pnl(&self) -> f64 {
+        0.0
+    }
+    /// Lifetime fees paid by the strategy.
+    fn fees_paid(&self) -> f64 {
+        0.0
+    }
+    /// Total number of fills the strategy has booked (buys + sells).
+    fn trade_count(&self) -> u64 {
+        0
+    }
+    /// Serialize the strategy's internal dynamic state to JSON for resume.
+    /// Returns `None` when the strategy cannot meaningfully persist state
+    /// (e.g. Rhai scripts, whose state lives in the engine scope).
+    fn serialize_state(&self) -> Option<String> {
+        None
+    }
+    /// Best-effort restore of state produced by `serialize_state`. Implementations
+    /// must tolerate malformed or stale JSON by leaving themselves unchanged.
+    fn restore_state(&mut self, _json: &str) {}
 }
 
 type AlgoBuilder = fn(&HashMap<String, String>) -> Result<Box<dyn Algorithm>, String>;
