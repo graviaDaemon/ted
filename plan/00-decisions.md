@@ -66,3 +66,64 @@ async actor core (engine + runners) is sound and is kept. Request: `requests/202
 
 Changeset order (by dependency): 01 foundations (config + logging) → 02 fee/trend/risk grid →
 03 backtester → 04 storage tiering + resume → 05 exchange trait seam.
+
+---
+
+## 2026-06-23 — Make the grid deployable: balance-aware sizing, no-short fills, live risk (see plan/06-grid-deployable.md)
+
+Context: After the 01–05 overhaul shipped, the bot was run live again and still made ~$0. Root-cause
+analysis of the uploaded history (`requests/history/`: `ted.db`, `logs/`, `trades/` — 39 runner
+sessions, 2,082 fills, 14,299 snapshots, Apr→Jun 2026) found the failures are **operational, not
+strategy-design**: the grid concept is sound but is starved of capital, corrupted by a phantom-fill
+bug, and its risk controls are left off. Request: `requests/2026-06-profitability.md`. The full
+empirical diagnosis is summarized in the plan file.
+
+- **Decision:** Fix the operational foundation before adding any new strategy type. The grid stays;
+  no momentum/scalper algo this round.
+  **Why:** The data shows a *correctly-running two-sided grid is exactly the "profit on small moves,
+  regardless of direction" behaviour the user asked for.* A new algorithm would inherit the same
+  capital, sizing, and fill-accounting defects and produce equally untrustworthy results. Validate the
+  grid on the existing backtester (plan/03) first; revisit new strategies as a later changeset.
+
+- **Decision:** Order sizing becomes **balance-aware at the grid/runner runtime**, driven by a
+  per-runner `capital` (quote budget) option rather than a raw fixed `qty`.
+  **Why:** The proximate cause of "no profit" was undercapitalization: the live wallet held ~$3.60 USD
+  while each grid level needed ~$24, so **every buy was skipped** (`Insufficient USD … — skipping BUY`)
+  and the grid ran sell-only, drifting one direction and never round-tripping (runner 39 ran 5 days
+  with `open_buys = 0`). A static `qty` baked at spawn cannot adapt to the real wallet. Scout already
+  sizes against a portfolio, but it emitted a fixed `qty` for a portfolio that wasn't actually funded.
+
+- **Decision:** Capital is **one shared ~$183 USD wallet** split across whatever symbols scout selects;
+  sizing reserves a fraction of each runner's budget to keep the buy side fundable ("split capital,
+  reserve for buys"). Scout assigns per-symbol budgets summing to ≤ total liquid USD.
+  **Why:** User confirmed a single ~$183 account (≈ +$100 later), symbols TBD via a fresh `scout` run.
+  Independent per-symbol 40%-of-full allocation (scout's old Step 4) over-commits one shared wallet
+  when several runners run at once — that recreates the buy-starvation bug in a new form.
+
+- **Decision:** The grid is **spot-only and must never go net short.** Cap emitted sells at held base
+  inventory; the bot may not sell base it does not hold.
+  **Why:** Runner 39 booked a phantom **−21.91 XRP** short after a `SELL FAILED: not enough exchange
+  balance` event, driving reported equity to −$20. Forbidding net-short at the strategy level is the
+  clean root fix and matches the account's spot (non-margin) reality.
+
+- **Decision:** Make exchange order state **authoritative for fills**; stop booking a fill from an
+  order's mere absence in a snapshot. Resolve "missing" orders via `fetch_order_history` (filled vs
+  cancelled) before booking, keeping WS `OrderFilled` as the fast path.
+  **Why:** `runner/mod.rs` snapshot-diff self-documents (lines ~443) that an out-of-band cancel is
+  booked as a phantom fill. Phantom fills corrupt position, equity, and PnL.
+
+- **Decision:** Turn the plan/02 risk controls **on** in the live config and scout output:
+  `max_position`, `max_drawdown_pct`, `stop_loss_pct`, `trend_filter`, `allow_unprofitable=false`.
+  **Why:** They shipped but the live config left them at off/unbounded defaults (zero log hits for
+  `trend`/`drawdown`/`halt`/`max_position`/`unprofitable`). The safety net designed in the overhaul
+  was never actually engaged.
+
+- **Decision:** Drop the invalid `XAUD:USD` symbol (a typo for `XAUT:USD`) and validate a symbol at
+  spawn, refusing unknown symbols with a clear error instead of running a perpetually-erroring runner.
+  **Why:** `XAUD:USD` ran for days emitting `symbol: invalid` / HTTP 500 on every reconnect.
+
+- **Correction (not a bug):** Realized-PnL **persistence is fine** — `runner/state.rs` writes
+  `algorithm.realized_pnl()` into snapshots/rollups. The DB reads ~0 because the capital-starved
+  runners never completed round-trips (a sell with no inventory realizes 0 under avg-cost), not
+  because the writer drops it. Secondary gap noted: `AvgCostBook::avg_cost()` returns 0 for short
+  positions, so unrealized PnL on a (now-forbidden) short is misreported.

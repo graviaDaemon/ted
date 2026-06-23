@@ -10,9 +10,11 @@ enum TrendFilter {
     Ema,
 }
 
-/// Dynamic grid state persisted for resume. Configuration-derived fields
-/// (levels, qty, fees, trend/risk settings) are not serialized — they are
-/// rebuilt from options on spawn; only the evolving runtime state is restored.
+/// Dynamic grid state persisted for resume. Most configuration-derived fields
+/// (fees, trend/risk settings) are rebuilt from options on spawn; but the
+/// capital-derived `qty` and the possibly-reduced `levels_per_side` are computed
+/// once at runtime from a live midpoint, so they (and the sizing/seeding latches)
+/// are serialized to survive a restart.
 #[derive(Serialize, Deserialize)]
 struct GridState {
     buy_orders: HashMap<u64, f64>,
@@ -29,6 +31,11 @@ struct GridState {
     unprofitable: bool,
     emitted_buy_prices: HashSet<u64>,
     emitted_sell_prices: HashSet<u64>,
+    qty: f64,
+    levels_per_side: u32,
+    sized: bool,
+    base_seeded: bool,
+    unfundable: bool,
 }
 
 pub struct GridBot {
@@ -36,6 +43,17 @@ pub struct GridBot {
     qty: f64,
     spacing: f64,
     price_decimals: u32,
+
+    // Balance-aware sizing (plan/06 step 1). `qty` above is derived from these at
+    // the first `build_grid` when a midpoint is known, unless an explicit `qty`
+    // option was supplied (back-compat), in which case `sized` is true from `new`.
+    capital: Option<f64>,
+    buy_reserve_frac: f64,
+    min_notional: f64,
+    initial_base_balance: f64,
+    sized: bool,
+    base_seeded: bool,
+    unfundable: bool,
 
     grid_lower_bound: f64,
     grid_upper_bound: f64,
@@ -80,15 +98,55 @@ impl GridBot {
             return Err("Option 'levels' must be at least 1".to_string());
         }
 
-        let qty = options
-            .get("qty")
-            .ok_or("Missing required option: qty")?
-            .parse::<f64>()
-            .map_err(|_| "Option 'qty' must be a valid number".to_string())?;
+        let qty_override = match options.get("qty") {
+            Some(v) => {
+                let q = v
+                    .parse::<f64>()
+                    .map_err(|_| "Option 'qty' must be a valid number".to_string())?;
+                if q <= 0.0 {
+                    return Err("Option 'qty' must be positive".to_string());
+                }
+                Some(q)
+            }
+            None => None,
+        };
 
-        if qty <= 0.0 {
-            return Err("Option 'qty' must be positive".to_string());
-        }
+        let capital = match options.get("capital") {
+            Some(v) => {
+                let c = v
+                    .parse::<f64>()
+                    .map_err(|_| "Option 'capital' must be a valid number".to_string())?;
+                if c <= 0.0 {
+                    return Err("Option 'capital' must be positive".to_string());
+                }
+                Some(c)
+            }
+            None => None,
+        };
+
+        // `qty` (explicit, fixed) wins for back-compat; otherwise `capital` drives
+        // a midpoint-derived `qty` at the first build. One of the two is required.
+        let (qty, sized, capital) = match (qty_override, capital) {
+            (Some(q), _) => (q, true, None),
+            (None, Some(c)) => (0.0, false, Some(c)),
+            (None, None) => {
+                return Err(
+                    "Missing required option: provide either 'qty' or 'capital'".to_string()
+                );
+            }
+        };
+
+        let buy_reserve_frac = options
+            .get("buy_reserve_frac")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && *v <= 1.0)
+            .unwrap_or(0.5);
+
+        let min_notional = options
+            .get("min_notional")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(25.0);
 
         let spacing_str = options
             .get("spacing")
@@ -164,6 +222,13 @@ impl GridBot {
             qty,
             spacing,
             price_decimals,
+            capital,
+            buy_reserve_frac,
+            min_notional,
+            initial_base_balance: base_balance,
+            sized,
+            base_seeded: false,
+            unfundable: false,
             grid_lower_bound: 0.0,
             grid_upper_bound: 0.0,
             buy_orders: HashMap::new(),
@@ -289,7 +354,126 @@ impl GridBot {
         }
     }
 
+    fn round_qty(qty: f64) -> f64 {
+        (qty * 1e8).floor() / 1e8
+    }
+
+    /// Derive a uniform per-level `qty` from the `capital` quote budget at the
+    /// given midpoint (plan/06 step 1). Reserves `buy_reserve_frac` of capital to
+    /// fund the buy ladder; reduces `levels_per_side` so each level clears
+    /// `min_notional`; caps `qty` by held base so the sell ladder is fundable too.
+    /// Flags the runner `unfundable` (and warns) if the budget cannot fund even one
+    /// level at `min_notional`.
+    fn size_from_capital(&mut self, midpoint: f64) {
+        let Some(capital) = self.capital else {
+            return;
+        };
+        if midpoint <= 0.0 {
+            return;
+        }
+
+        let buy_budget = capital * self.buy_reserve_frac;
+        // Each level costs ~ buy_budget / levels in quote; cap levels so that
+        // per-level notional stays >= min_notional.
+        let max_fundable = (buy_budget / self.min_notional).floor() as u32;
+        if max_fundable < 1 {
+            self.unfundable = true;
+            self.qty = 0.0;
+            crate::logger::log_warn(
+                "[GRID]",
+                &format!(
+                    "Capital {:.2} (buy budget {:.2} = capital × {:.2}) cannot fund a single level at min_notional {:.2} — emitting no orders. Increase capital or lower min_notional.",
+                    capital, buy_budget, self.buy_reserve_frac, self.min_notional
+                ),
+            );
+            return;
+        }
+
+        let levels = self.levels_per_side.min(max_fundable);
+        if levels < self.levels_per_side {
+            crate::logger::log_warn(
+                "[GRID]",
+                &format!(
+                    "Capital {:.2} (buy budget {:.2}) funds only {} of {} requested levels/side at min_notional {:.2} — reducing to {}.",
+                    capital, buy_budget, levels, self.levels_per_side, self.min_notional, levels
+                ),
+            );
+            self.levels_per_side = levels;
+        }
+
+        let qty_from_quote = buy_budget / (levels as f64 * midpoint);
+        let qty = if self.initial_base_balance > 0.0 {
+            // Hold base already: size so both ladders are fundable from inventory.
+            let qty_from_base = self.initial_base_balance / levels as f64;
+            qty_from_quote.min(qty_from_base)
+        } else {
+            qty_from_quote
+        };
+        let qty = Self::round_qty(qty);
+
+        if qty <= 0.0 || qty * midpoint < self.min_notional - 1e-9 {
+            self.unfundable = true;
+            self.qty = 0.0;
+            crate::logger::log_warn(
+                "[GRID]",
+                &format!(
+                    "Derived per-level notional {:.2} (qty {:.8} × midpoint {:.2}) is below min_notional {:.2} — emitting no orders.",
+                    qty * midpoint, qty, midpoint, self.min_notional
+                ),
+            );
+            return;
+        }
+
+        self.qty = qty;
+        self.unfundable = false;
+        crate::logger::log_info(
+            "[GRID]",
+            &format!(
+                "Sized from capital {:.2}: qty {:.8}/level × {} levels/side (buy budget {:.2}, reserve {:.0}% for buys, midpoint {:.2}).",
+                capital,
+                qty,
+                self.levels_per_side,
+                buy_budget,
+                self.buy_reserve_frac * 100.0,
+                midpoint,
+            ),
+        );
+    }
+
+    /// Net base the grid currently holds: seeded opening inventory plus
+    /// grid-acquired position. The spot-only invariant is that this never goes
+    /// below zero.
+    fn held_base(&self) -> f64 {
+        self.book.position
+    }
+
+    /// Base not already earmarked by resting sell orders — the room available for a
+    /// *new* sell without risking a net-short position once everything fills.
+    fn sell_headroom(&self) -> f64 {
+        self.held_base() - self.qty * self.sell_orders.len() as f64
+    }
+
+    /// True when one more `qty` sell can rest without driving net base below zero.
+    fn can_place_sell(&self) -> bool {
+        self.qty > 0.0 && self.sell_headroom() >= self.qty - 1e-9
+    }
+
     fn build_grid(&mut self, midpoint: f64) -> Vec<TradeSignal> {
+        // Derive sizing from the capital budget the first time we have a midpoint,
+        // and seed any pre-existing base inventory into the book so the no-short
+        // invariant (position >= 0) accounts for base we already hold.
+        if !self.sized {
+            self.size_from_capital(midpoint);
+            self.sized = true;
+        }
+        if !self.base_seeded {
+            self.book.seed_position(self.initial_base_balance, midpoint);
+            self.base_seeded = true;
+        }
+        if self.unfundable {
+            return vec![];
+        }
+
         if !self.allow_unprofitable && self.maker_fee > 0.0 {
             let fee_floor = 2.0 * self.maker_fee * midpoint;
             if self.spacing <= fee_floor {
@@ -327,7 +511,15 @@ impl GridBot {
             }
         }
 
-        for i in 0..self.levels_per_side {
+        // Spot-only (plan/06 step 2): only place sell levels backed by held base.
+        // With no base held the grid is buy-first — the sell ladder stays empty
+        // until a buy fills and creates inventory to sell against.
+        let max_sells = if self.qty > 0.0 {
+            (self.held_base() / self.qty + 1e-9).floor().max(0.0) as u32
+        } else {
+            0
+        };
+        for i in 0..self.levels_per_side.min(max_sells) {
             let price = ((midpoint + (i as f64 + 1.0) * self.spacing) * m).round() / m;
             self.sell_orders.insert(self.price_key(price), price);
         }
@@ -533,7 +725,7 @@ impl Algorithm for GridBot {
                 });
             }
 
-            if self.sells_enabled(current_price) {
+            if self.sells_enabled(current_price) && self.can_place_sell() {
                 let counter = ((current_price + self.spacing) * m).round() / m;
                 self.sell_orders.insert(self.price_key(counter), counter);
                 crate::logger::log(
@@ -624,7 +816,7 @@ impl Algorithm for GridBot {
                 }
             }
 
-            if self.sells_enabled(current_price) {
+            if self.sells_enabled(current_price) && self.can_place_sell() {
                 let highest_sell = self
                     .sell_orders
                     .values()
@@ -728,6 +920,11 @@ impl Algorithm for GridBot {
             unprofitable: self.unprofitable,
             emitted_buy_prices: self.emitted_buy_prices.clone(),
             emitted_sell_prices: self.emitted_sell_prices.clone(),
+            qty: self.qty,
+            levels_per_side: self.levels_per_side,
+            sized: self.sized,
+            base_seeded: self.base_seeded,
+            unfundable: self.unfundable,
         };
         serde_json::to_string(&state).ok()
     }
@@ -757,12 +954,18 @@ impl Algorithm for GridBot {
         self.unprofitable = state.unprofitable;
         self.emitted_buy_prices = state.emitted_buy_prices;
         self.emitted_sell_prices = state.emitted_sell_prices;
+        self.qty = state.qty;
+        self.levels_per_side = state.levels_per_side;
+        self.sized = state.sized;
+        self.base_seeded = state.base_seeded;
+        self.unfundable = state.unfundable;
         crate::logger::log_info(
             "[GRID]",
             &format!(
-                "Grid state restored: {} buys, {} sells, position {:.8}, realized {:.8}.",
+                "Grid state restored: {} buys, {} sells, qty {:.8}, position {:.8}, realized {:.8}.",
                 self.buy_orders.len(),
                 self.sell_orders.len(),
+                self.qty,
                 self.book.position,
                 self.book.realized_pnl,
             ),
@@ -782,11 +985,29 @@ impl Algorithm for GridBot {
         } else {
             "unbounded".to_string()
         };
+        let sizing = match self.capital {
+            Some(c) => format!(
+                "capital {:.2} (reserve {:.0}% for buys, min_notional {:.2})",
+                c,
+                self.buy_reserve_frac * 100.0,
+                self.min_notional
+            ),
+            None => "fixed qty".to_string(),
+        };
+        let status = if self.unfundable {
+            "NO — capital cannot fund a level at min_notional, grid not building"
+        } else if self.unprofitable {
+            "NO — spacing below fee floor, grid not building"
+        } else {
+            "yes"
+        };
         Some(format!(
-            "GridBot\n  Levels/side:  {}\n  Range:        {:.prec$} – {:.prec$}\n  Spacing:      {:.prec$}\n  Fees:         maker {:.6}, taker {:.6}\n  Trades:       {} buys, {} sells\n  Orders:       {} buy open, {} sell open\n  Position:     {:.8} (net qty), max {}\n  Avg cost:     {:.prec$}\n  Trend:        {} (EMA period {:.0}, threshold {:.4})\n  Realized PnL: {:.8}\n  Fees paid:    {:.8}\n  Unrealized:   {:.8} (at last mid)\n  Profitable:   {}",
+            "GridBot\n  Levels/side:  {}\n  Range:        {:.prec$} – {:.prec$}\n  Spacing:      {:.prec$}\n  Sizing:       {}\n  Qty/level:    {:.8}\n  Fees:         maker {:.6}, taker {:.6}\n  Trades:       {} buys, {} sells\n  Orders:       {} buy open, {} sell open\n  Position:     {:.8} (net qty), max {}\n  Avg cost:     {:.prec$}\n  Trend:        {} (EMA period {:.0}, threshold {:.4})\n  Realized PnL: {:.8}\n  Fees paid:    {:.8}\n  Unrealized:   {:.8} (at last mid)\n  Profitable:   {}",
             self.levels_per_side,
             lower, upper,
             self.spacing,
+            sizing,
+            self.qty,
             self.maker_fee, self.taker_fee,
             self.total_buys, self.total_sells,
             self.buy_orders.len(), self.sell_orders.len(),
@@ -796,7 +1017,7 @@ impl Algorithm for GridBot {
             self.book.realized_pnl,
             self.book.fees_paid,
             unrealized,
-            if self.unprofitable { "NO — spacing below fee floor, grid not building" } else { "yes" },
+            status,
             prec = prec,
         ))
     }
@@ -959,5 +1180,123 @@ mod tests {
         let mut unbounded = GridBot::new(&base_opts()).unwrap();
         let sigs = unbounded.on_fill(100.0, true, 100.0);
         assert!(has_buy(&sigs), "unbounded grid should emit a buy extension");
+    }
+
+    fn count_sells(signals: &[TradeSignal]) -> usize {
+        signals.iter().filter(|s| matches!(s, TradeSignal::Sell { .. })).count()
+    }
+
+    #[test]
+    fn requires_qty_or_capital() {
+        let o = opts(&[("levels", "2"), ("spacing", "10")]);
+        assert!(GridBot::new(&o).is_err(), "neither qty nor capital should be rejected");
+    }
+
+    #[test]
+    fn explicit_qty_is_back_compat() {
+        let o = opts(&[("levels", "2"), ("qty", "0.5"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        assert!(g.sized, "explicit qty means already sized");
+        assert!((g.qty - 0.5).abs() < 1e-9);
+        g.build_grid(100.0);
+        assert!((g.qty - 0.5).abs() < 1e-9, "explicit qty must not be overwritten by sizing");
+        assert!(!g.unfundable);
+    }
+
+    #[test]
+    fn capital_derives_qty_from_buy_budget() {
+        // buy budget = 600 × 0.5 = 300 → qty = 300 / (3 × 100) = 1.0
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        assert!(!g.sized, "capital-based grid sizes lazily at first build");
+        let sigs = g.build_grid(100.0);
+        assert!((g.qty - 1.0).abs() < 1e-9, "derived qty {}", g.qty);
+        let buy_budget = 600.0 * 0.5;
+        assert!(
+            (g.qty * 100.0 * g.levels_per_side as f64 - buy_budget).abs() < 1e-6,
+            "qty × midpoint × levels ({}) should ≈ buy budget ({})",
+            g.qty * 100.0 * g.levels_per_side as f64,
+            buy_budget
+        );
+        assert!(!g.unfundable);
+        assert!(!sigs.is_empty());
+    }
+
+    #[test]
+    fn capital_below_one_level_is_unfundable() {
+        // buy budget = 40 × 0.5 = 20 < min_notional 25 → cannot fund any level.
+        let o = opts(&[("levels", "3"), ("capital", "40"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        let sigs = g.build_grid(100.0);
+        assert!(sigs.is_empty(), "unfundable grid must emit no orders");
+        assert!(g.unfundable);
+        assert!(g.summary().unwrap().contains("NO"));
+    }
+
+    #[test]
+    fn capital_reduces_levels_to_what_budget_funds() {
+        // buy budget = 120 × 0.5 = 60 → max fundable = floor(60 / 25) = 2 levels.
+        let o = opts(&[("levels", "6"), ("capital", "120"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        assert_eq!(g.levels_per_side, 2, "levels should reduce to what the budget funds");
+        assert!(!g.unfundable);
+        // Each level clears min_notional: qty = 60 / (2 × 100) = 0.3 → 0.3 × 100 = 30 ≥ 25.
+        assert!(g.qty * 100.0 >= 25.0 - 1e-9, "per-level notional {}", g.qty * 100.0);
+    }
+
+    #[test]
+    fn no_base_is_buy_first_with_empty_sell_ladder() {
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        let sigs = g.build_grid(100.0);
+        assert_eq!(g.sell_orders.len(), 0, "no held base → sell ladder starts empty");
+        assert!(!g.buy_orders.is_empty(), "buy ladder should be populated");
+        assert_eq!(count_sells(&sigs), 0, "no initial sell signals without inventory");
+    }
+
+    #[test]
+    fn no_short_invariant_caps_sell_emission() {
+        // Hold exactly one unit of base: only one sell level may rest, and once it
+        // fills the would-be extension sell is suppressed (no net short).
+        let o = opts(&[
+            ("levels", "3"),
+            ("qty", "1"),
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+            ("initial_base_balance", "1"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        let sigs = g.build_grid(100.0);
+        assert_eq!(count_sells(&sigs), 1, "only 1 sell backed by 1 unit of held base");
+        assert!((g.book.position - 1.0).abs() < 1e-9, "seeded position {}", g.book.position);
+
+        // The single sell fills; inventory is now flat, so the extension sell must
+        // be suppressed — the grid never emits a sell that would drive position < 0.
+        let after = g.on_fill(110.0, false, 110.0);
+        assert!(g.book.position >= -1e-9, "position must not go net short: {}", g.book.position);
+        assert_eq!(count_sells(&after), 0, "extension sell suppressed when flat");
+    }
+
+    #[test]
+    fn seeded_base_round_trips_in_serialize_restore() {
+        let o = opts(&[
+            ("levels", "2"),
+            ("capital", "600"),
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        g.on_fill(90.0, true, 90.0);
+        let json = g.serialize_state().expect("should serialize");
+
+        // Rebuild from the same options (qty/levels not yet derived) then restore.
+        let mut restored = GridBot::new(&o).unwrap();
+        restored.restore_state(&json);
+        assert!((restored.qty - g.qty).abs() < 1e-9, "derived qty must survive restore");
+        assert_eq!(restored.levels_per_side, g.levels_per_side);
+        assert!(restored.sized && restored.base_seeded);
+        assert!((restored.book.position - g.book.position).abs() < 1e-9);
     }
 }

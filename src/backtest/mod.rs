@@ -803,6 +803,56 @@ mod tests {
     }
 
     #[test]
+    fn capital_grid_round_trips_non_negative_and_no_short() {
+        // Balance-aware sizing (plan/06 step 1) + spot-only no-short (step 2) in a
+        // full backtester replay: a buy-first grid (no starting base) sized from a
+        // capital budget should buy the dip, counter-sell the recovery, end
+        // non-negative, and never hold a net-short position at any point.
+        let options = opt(&[
+            ("levels", "1"),
+            ("capital", "50"), // buy budget 25 funds exactly one $25 level
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+        ]);
+        let mut c = cfg(options, 0.0);
+        c.start_base_balance = 0.0; // buy-first
+        let report = run_backtest(&c, &oscillation()).unwrap();
+
+        assert!(report.trades.len() >= 2, "expected a buy + counter-sell round-trip, got {}", report.trades.len());
+        assert!(
+            report.realized_pnl_net >= -1e-9,
+            "realized PnL must be non-negative, got {}",
+            report.realized_pnl_net
+        );
+        assert!(
+            report.ending_position >= -1e-9,
+            "spot grid must never end net short, got {}",
+            report.ending_position
+        );
+        for t in &report.trades {
+            assert!(
+                t.position_after >= -1e-9,
+                "no-short invariant violated mid-replay: position {} after trade",
+                t.position_after
+            );
+        }
+    }
+
+    #[test]
+    fn capital_below_min_notional_emits_no_trades() {
+        // Buy budget 10 (= 20 × 0.5) is below the $25 min_notional → unfundable, so
+        // the grid builds nothing and the replay produces no trades.
+        let options = opt(&[
+            ("levels", "3"),
+            ("capital", "20"),
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+        ]);
+        let report = run_backtest(&cfg(options, 0.0), &oscillation()).unwrap();
+        assert_eq!(report.trades.len(), 0, "unfundable grid must not trade");
+    }
+
+    #[test]
     fn loads_csv_and_jsonl() {
         let csv = "timestamp,open,close,high,low,volume\n1,100,101,102,99,5\n2,101,102,103,100,6\n";
         let from_csv = parse_csv(csv).unwrap();

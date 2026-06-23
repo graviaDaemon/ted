@@ -222,6 +222,34 @@ pub async fn run_runner(
                     return;
                 }
             }
+        } else {
+            // No ATR fetch to implicitly validate the symbol, so probe it
+            // explicitly (plan/06 step 5): refuse to start an unknown symbol with a
+            // clear one-line error instead of letting it run and spew
+            // `symbol: invalid` / HTTP 500 on every reconnect (cf. the `XAUD:USD`
+            // typo that ran for days).
+            match engine.fetch_candles(symbol.clone(), "1m".to_string(), 1).await {
+                Ok(candles) if !candles.is_empty() => {}
+                Ok(_) => {
+                    crate::logger::log(
+                        &src,
+                        &format!(
+                            "Symbol '{}' returned no market data — likely invalid/unsupported. Refusing to start.",
+                            symbol
+                        ),
+                    );
+                    engine.unsubscribe(symbol.clone()).await;
+                    return;
+                }
+                Err(e) => {
+                    crate::logger::log(
+                        &src,
+                        &format!("Symbol '{}' validation failed: {} — refusing to start.", symbol, e),
+                    );
+                    engine.unsubscribe(symbol.clone()).await;
+                    return;
+                }
+            }
         }
     } else {
         options
@@ -247,6 +275,25 @@ pub async fn run_runner(
         .get("max_drawdown_pct")
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0);
+
+    // Sanity-check the capital budget against the quote actually free in the wallet
+    // (plan/06 step 1). The wallet is shared across runners, so this is a warning,
+    // not a hard refusal — other runners may legitimately hold the remainder.
+    if let Some(capital) = options.get("capital").and_then(|v| v.parse::<f64>().ok()) {
+        let free_quote = options
+            .get("initial_quote_balance")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if capital > free_quote {
+            crate::logger::log_warn(
+                &src,
+                &format!(
+                    "capital={:.2} exceeds currently-free quote {:.2}. If other runners hold the rest this is fine; otherwise the buy ladder may be under-funded.",
+                    capital, free_quote
+                ),
+            );
+        }
+    }
 
     let algorithm = match build_algorithm(&algo_name, &options) {
         Ok(a) => a,
@@ -424,59 +471,15 @@ pub async fn run_runner(
                     Some(EngineEvent::OrderNew) => {}
 
                     Some(EngineEvent::OrderSnapshot { order_ids }) => {
+                        // An order tracked as pending but absent from the snapshot is
+                        // either filled OR cancelled out-of-band. Exchange order state
+                        // is authoritative (plan/06 step 3): never book a fill from mere
+                        // absence — resolve each missing id against
+                        // `fetch_order_history` (filled vs cancelled) before booking.
+                        // The fast path (WS `OrderFilled` → `process_fill`) still books
+                        // confirmed fills immediately.
                         let snapshot: HashSet<i64> = order_ids.into_iter().collect();
-                        let filled_buys: Vec<(i64, f64, f64)> = state.pending_buy_orders
-                            .iter()
-                            .filter(|(id, _)| !snapshot.contains(*id))
-                            .map(|(&id, &(p, q))| (id, p, q))
-                            .collect();
-                        let filled_sells: Vec<(i64, f64, f64)> = state.pending_sell_orders
-                            .iter()
-                            .filter(|(id, _)| !snapshot.contains(*id))
-                            .map(|(&id, &(p, q))| (id, p, q))
-                            .collect();
-                        let current_price = if state.last_bid > 0.0 && state.last_ask > 0.0 {
-                            (state.last_bid + state.last_ask) / 2.0
-                        } else {
-                            0.0
-                        };
-                        // NOTE: snapshot-diff infers a fill purely from an order's
-                        // absence, so an order cancelled out-of-band is booked as a
-                        // phantom fill here. The history-based reconcile path
-                        // (`sync_orders_after_reconnect`, run on AuthConnected) is the
-                        // authoritative reconciler on resume and distinguishes filled
-                        // from cancelled via `fetch_order_history`; this diff stays as a
-                        // best-effort fallback between snapshots.
-                        let mut fill_signals = vec![];
-                        for (id, price, qty) in &filled_buys {
-                            state.live_order_ids.remove(id);
-                            state.pending_buy_orders.remove(id);
-                            let before = state.algorithm.realized_pnl();
-                            fill_signals.extend(state.algorithm.on_fill(*price, true, current_price));
-                            let realized = state.algorithm.realized_pnl() - before;
-                            crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(Some(*id), true, *price, *qty, Some(realized));
-                        }
-                        for (id, price, qty) in &filled_sells {
-                            state.live_order_ids.remove(id);
-                            state.pending_sell_orders.remove(id);
-                            let before = state.algorithm.realized_pnl();
-                            fill_signals.extend(state.algorithm.on_fill(*price, false, current_price));
-                            let realized = state.algorithm.realized_pnl() - before;
-                            crate::logger::log(&src, &format!("Order {} absent from snapshot — assumed filled @ {:.2}.", id, price));
-                            state.write_fill_to_db(Some(*id), false, *price, *qty, Some(realized));
-                        }
-                        if !filled_buys.is_empty() || !filled_sells.is_empty() {
-                            state.save_state();
-                        }
-                        let stale: Vec<i64> = state.live_order_ids.iter().copied().filter(|id| !snapshot.contains(id)).collect();
-                        for id in &stale { state.live_order_ids.remove(id); }
-                        if !stale.is_empty() {
-                            crate::logger::log(&src, &format!("Auth WS snapshot: pruned {} stale order id(s).", stale.len()));
-                        }
-                        if !fill_signals.is_empty() {
-                            dispatch_signals(&mut state, &fill_signals, &engine).await;
-                        }
+                        reconcile::resolve_snapshot_absences(&src, &mut state, &engine, &snapshot).await;
                     }
 
                     Some(EngineEvent::WalletSnapshot { balances }) => {
