@@ -12,7 +12,7 @@ mod engine;
 mod exchange;
 
 use crate::config::config::{Config, CredentialMode};
-use crate::config::channels::{RunnerControl, RunnerMode};
+use crate::config::channels::{RunnerControl, RunnerMode, TuiEvent};
 use crate::logger::LogLevel;
 use crate::commands::cli::{Cli, CliAction};
 use crate::engine::spawn_engine;
@@ -33,7 +33,7 @@ use tokio::time::timeout;
 #[tokio::main]
 async fn main() {
     let (log_tx, mut log_rx) = channel::<String>(256);
-    let (ticker_tx, mut ticker_rx) = channel::<(String, f64)>(64);
+    let (tui_tx, mut tui_rx) = channel::<TuiEvent>(256);
 
     let mut config = Config::load_config("config.json").expect("Failed to load config.json");
     if let Err(e) = &config.validate() {
@@ -51,7 +51,7 @@ async fn main() {
     };
 
     crate::storage::data_dir();
-    logger::init_ticker(ticker_tx);
+    logger::init_tui_events(tui_tx);
     let min_level = LogLevel::from_str(&config.startup_defaults.log_level);
     if let Err(e) = logger::init(log_tx, config.startup_defaults.log_retention, min_level) {
         eprintln!("Warning: could not initialise log file: {}", e);
@@ -97,12 +97,8 @@ async fn main() {
     let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
     let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
 
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        default_hook(info);
-    }));
-
+    // Terminal restoration on panic (raw mode + alternate screen) is handled by
+    // the hook ratatui installs inside Tui::enter().
     let mut tui = match tui::Tui::enter() {
         Ok(t) => t,
         Err(e) => {
@@ -110,6 +106,14 @@ async fn main() {
             return;
         }
     };
+
+    {
+        let db_path = crate::storage::data_dir().join("ted.db");
+        match crate::storage::db::Db::open(&db_path).and_then(|db| db.recent_fills(50)) {
+            Ok(fills) => tui.preload_trades(fills),
+            Err(e) => logger::log_warn("[TUI]", &format!("Could not preload recent trades: {}", e)),
+        }
+    }
 
     let mut events = EventStream::new();
 
@@ -149,9 +153,9 @@ async fn main() {
                 }
             }
 
-            msg = ticker_rx.recv() => {
-                if let Some((symbol, bid)) = msg {
-                    tui.handle_ticker(symbol, bid);
+            msg = tui_rx.recv() => {
+                if let Some(event) = msg {
+                    tui.handle_event(event);
                 }
             }
         }
@@ -414,6 +418,86 @@ async fn dispatch(
                     }
                 }
                 Err(e) => logger::log("[BACKTEST]", &format!("Backtest failed: {}", e)),
+            }
+        }
+
+        CliAction::Sweep {
+            symbol,
+            timeframe,
+            limit,
+            from_file,
+            spacings,
+            levels,
+            capital,
+            spread,
+            maker_fee,
+            taker_fee,
+            start_quote,
+            start_base,
+        } => {
+            let candles = if let Some(path) = &from_file {
+                crate::backtest::load_candles_from_file(path)
+            } else {
+                exchange.fetch_candle_history(&symbol, &timeframe, limit).await
+            };
+
+            let candles = match candles {
+                Ok(c) => c,
+                Err(e) => {
+                    logger::log("[SWEEP]", &format!("Failed to load candles: {}", e));
+                    return;
+                }
+            };
+
+            // The budget each combination sizes from and the replay wallet
+            // default to each other, so passing just --capital replays the
+            // exact funded reality.
+            let (capital, start_quote) = match (capital, start_quote) {
+                (Some(c), Some(q)) => (c, q),
+                (Some(c), None) => (c, c),
+                (None, Some(q)) => (q, q),
+                (None, None) => (10_000.0, 10_000.0),
+            };
+
+            logger::log(
+                "[SWEEP]",
+                &format!(
+                    "Loaded {} candles for {} — sweeping spacing × levels…",
+                    candles.len(),
+                    symbol
+                ),
+            );
+
+            let sweep_cfg = crate::backtest::sweep::SweepConfig {
+                symbol: symbol.clone(),
+                timeframe,
+                capital,
+                spacings,
+                levels,
+                spread,
+                maker_fee,
+                taker_fee,
+                start_quote_balance: start_quote,
+                start_base_balance: start_base,
+            };
+
+            match crate::backtest::sweep::run_sweep(&sweep_cfg, &candles) {
+                Ok(result) => {
+                    for line in result.render_console().lines() {
+                        logger::log("[SWEEP]", line);
+                    }
+                    match crate::backtest::sweep::write_sweep_report(&result) {
+                        Ok(path) => logger::log(
+                            "[SWEEP]",
+                            &format!("Report written to {}", path.display()),
+                        ),
+                        Err(e) => logger::log(
+                            "[SWEEP]",
+                            &format!("Failed to write report: {}", e),
+                        ),
+                    }
+                }
+                Err(e) => logger::log("[SWEEP]", &format!("Sweep failed: {}", e)),
             }
         }
 

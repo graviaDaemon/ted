@@ -127,3 +127,132 @@ empirical diagnosis is summarized in the plan file.
   runners never completed round-trips (a sell with no inventory realizes 0 under avg-cost), not
   because the writer drops it. Secondary gap noted: `AvgCostBook::avg_cost()` returns 0 for short
   positions, so unrealized PnL on a (now-forbidden) short is misreported.
+
+---
+
+## 2026-07-07 — TUI dashboard rewrite (see plan/07-tui-dashboard.md)
+
+Context: Request `requests/2026-07-ui-and-gains.md` asks for two things: (a) a clearer TUI
+(per-coin profit/loss bar graph + last-trades panel + command line, instead of raw log scroll)
+and (b) another round of profitability work ("barely making money" after plan/06 ran live
+~2 weeks). The request is split into two changesets.
+
+- **Decision:** Split the request into two plans: `plan/07` (TUI dashboard, this entry) and
+  `plan/08` (gains — written later).
+  **Why:** The TUI is fully plannable from the current code. The gains work follows the plan/06
+  pattern: the user uploads the server's fresh data dir (`ted.db`, `logs/`, `trades/`, everything
+  since 2026-06-23) into `requests/history/`, an empirical diagnosis is done during planning, and
+  plan/08 is written around what the data shows — not around guesses.
+
+- **Decision:** Plan/08's user-selected levers are: **diagnosis-first**, a **backtest parameter
+  sweep** command (grid-search spacing/levels/capital over historical candles, rank by net PnL),
+  and **profit compounding** (roll realized PnL back into the runner's `capital` budget).
+  Symbol-switch guidance was offered and not selected as a code lever (scout covers it
+  operationally).
+  **Why:** User choice 2026-07-07. Recorded here so plan/08's scope is fixed before the data
+  arrives.
+
+- **Decision:** Rebuild the TUI on **ratatui**, replacing the hand-rolled crossterm cursor
+  positioning in `tui.rs`.
+  **Why:** The requested layout (bordered panels, a bar graph, a trades list, resize handling)
+  is exactly what ratatui provides declaratively. Hand-rolling panel clipping and bars on raw
+  cursor moves is *more* code and more fragile, not less — this is the anti-overengineering
+  choice despite being a new dependency. ratatui sits on top of crossterm, which is already a
+  dependency.
+
+- **Decision:** Two full-screen views toggled with **Tab**: **Dashboard** (PnL bars left,
+  last trades right, one-line warn/error notice, command line bottom) and **Logs** (the current
+  scrollback + the same command line). The most recent warn/error is surfaced on the dashboard.
+  **Why:** The request mockup has no log area, but the log stream is the primary way fills,
+  warnings, and halts are observed today. A toggle keeps both without cramping either. User
+  chose this over a split layout or file-only logs.
+
+- **Decision:** The dashboard is fed by widening the existing global ticker channel into a
+  `TuiEvent` enum (`Ticker`, `Fill`, `Status`, `RunnerStopped`) emitted from the runner's
+  existing hook points: `write_fill_to_db` (fills) and the snapshot tick / `persist_periodic`
+  (periodic status). No new bookkeeping or polling of runner internals.
+  **Why:** The runner already computes realized/unrealized PnL, equity, position, and open-order
+  counts every snapshot tick, and every fill already funnels through one method. Emitting events
+  from those two points keeps a single source of truth and costs a few lines per hook.
+
+- **Decision:** The bar graph shows per-symbol **session PnL = realized + unrealized**, as
+  horizontal bars custom-rendered (colored green/red by sign, scaled to the largest absolute
+  value on screen).
+  **Why:** Session PnL is what "is the bot making money right now" means; unrealized must be
+  included or inventory drift is invisible (the plan/06 diagnosis showed mark-to-market swings
+  dwarf realized capture). Custom rendering because ratatui's `BarChart` is unsigned — it cannot
+  show losses below a zero axis.
+
+- **Decision:** The last-trades panel **preloads the most recent fills from SQLite at startup**
+  (new `recent_fills` query joining `fills` × `runners`), then appends live fills.
+  **Why:** Otherwise the panel is empty after every restart even though the DB holds the full
+  fill history. The fills table already stores direction, price, quantity, realized PnL, and
+  timestamp — no schema change needed.
+
+---
+
+## 2026-07-07 — Gains round 3: ungate exits, rework trend filter, re-center, compound, sweep (see plan/08-grid-gains.md)
+
+Context: After plan/06 deployed (2026-06-23), one live SOLUSD runner earned **+$8.25 realized /
++$10.12 unrealized in 2 weeks** on ~$330 equity — then went **5 straight days with zero fills**.
+Fresh history uploaded to `requests/history/` (runners 40–41, 19,887 snapshots, 12 fills).
+Diagnosis: **all plan/06 fixes work** (two-sided build, capital sizing, no shorts, no buy-skips);
+the remaining defect is in the grid's own maintenance loop. Full evidence in the plan file.
+
+- **Decision:** Counter-orders (the exit side of a round trip) are **never gated by the trend
+  filter**. A buy fill always places its counter-sell (subject only to the no-short inventory
+  check); a sell fill always places its counter-buy (subject only to `max_position`/stop-loss).
+  **Why:** The gate fired at fill time, one-shot, against a tick-EMA with `trend_threshold`
+  defaulting to `0.0` — effectively a coin flip biased exactly wrong. Runner 40 bought 6 levels
+  down a falling market with **zero counter-sells ever placed** (`open_sells = 0` for its 5-day
+  life; not one "counter sell" line in any log); runner 41 sold 4 levels up a rally with **zero
+  counter-buys**. Suppressing exits doesn't reduce risk — it strands inventory and kills the
+  round-trip engine that produces all realized PnL.
+
+- **Decision:** The trend filter is **reworked, not removed** (user choice over defaulting it
+  off): it gates **extension buys only** — adding new exposure below the ladder in a falling
+  market — and blocks them only when the trend is *down* beyond a threshold. New trend measure:
+  **candle-close EMA** fetched/refreshed by the runner (same pattern as the ATR refresh), not the
+  per-tick EMA. `trend_threshold` default becomes **0.005** (was 0.0).
+  **Why:** The shipped filter had inverted semantics for a grid: it *allowed* extension buys to
+  march down the falling knife (runner 40 deployed ~$150 into the drop) while *blocking* the
+  counter-sell exits. A tick-EMA(50) spans minutes and is noise, not trend. The one genuinely
+  dangerous move for a spot grid is accumulating fresh exposure against a real downtrend — so
+  that is the only thing the filter now touches.
+
+- **Decision:** Add **fill-less re-centering**: when no grid level rests within a configurable
+  band of the mid price (default 2.5 × spacing, on both sides, with a 5-minute cooldown between
+  rebuilds), cancel the stale ladder and rebuild around the current mid. Rebuilds now **emit
+  Cancel signals for every remaining tracked level** (the existing rebuild path just cleared
+  internal maps, orphaning live orders on the exchange).
+  **Why:** The grid only slid on fills, so a stalled grid could never recover: runner 41 sat
+  5 days with 1 buy at 70.27 and 1 sell at 84.06 while mid oscillated ~79–83 — a 17% dead zone
+  inside the rebuild trigger's ×0.95/×1.05 bounds, so the trigger could never fire. No fill → no
+  slide → no fill, indefinitely.
+
+- **Decision:** **Compounding = `capital + net realized PnL`** (profits grow the budget, losses
+  shrink it), applied whenever sizing is re-derived — which now happens at every full rebuild,
+  folding compounding into the re-centering mechanism for free.
+  **Why:** User choice (over profits-only ratchet or manual). `AvgCostBook.realized_pnl` is
+  already net of fees, so it is the honest budget delta; shrinking after losses automatically
+  de-risks a small account.
+
+- **Decision:** Add a **`sweep` command**: cartesian grid-search over spacing × levels for one
+  symbol over one candle history (fetched once), each combination replayed through the existing
+  plan/03 backtester, ranked by net realized PnL with max-drawdown as tiebreaker. Default spacing
+  candidates derive from the candle set's ATR.
+  **Why:** User-selected lever. Parameters (`spacing=1.97`, `levels=2`) are currently hand-picked
+  by scout heuristics; the sweep replaces guesses with replayed evidence using machinery that
+  already exists. The backtester already models Cancel signals and freezes counter-orders within
+  a candle, so re-centering and the reworked filter are exercised faithfully in replay.
+
+- **Decision:** Scout emits the new knobs explicitly (`trend_threshold`, trend timeframe) and its
+  workflow gains a step: run `sweep` on the candidate symbols and take the top-ranked config
+  instead of computing spacing by heuristic alone.
+  **Why:** Round 2 established scout emits the full option set; leaving new options implicit is
+  how `trend_threshold=0.0` happened.
+
+- **Observation (for the record):** "Barely making money" was **not** under-performance of the
+  strategy concept: +$8.25 realized in the ~3 days the grid was actually two-sided and trading
+  annualizes to a healthy rate on this account size. The loss was the ~11 of 14 days spent
+  one-sided or deadlocked. Fixing flow-through, not raising per-trade capture, is the lever.

@@ -12,6 +12,8 @@
 //! so a buy and its counter-sell can never round-trip for free inside one candle;
 //! same-side grid *extensions* are free to chain as price wicks through them.
 
+pub mod sweep;
+
 use crate::algorithm::build_algorithm;
 use crate::algorithm::position::AvgCostBook;
 use crate::api::candles::Candle;
@@ -280,6 +282,17 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
 
     let mut algo = build_algorithm(&cfg.algorithm, &options)?;
 
+    // Rolling candle-close trend EMA, pushed to the algorithm before each
+    // candle's tick — the same feed the live runner's periodic candle refresh
+    // provides, so replay exercises the same trend filter (plan/08 step 2).
+    let trend_period = options
+        .get("trend_ema_period")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|p| *p > 0.0)
+        .unwrap_or(50.0);
+    let trend_alpha = 2.0 / (trend_period + 1.0);
+    let mut trend_ema: Option<f64> = None;
+
     let mut sim = Sim::new(cfg.start_quote_balance, cfg.start_base_balance, cfg.maker_fee);
     let mut equity_curve: Vec<f64> = Vec::with_capacity(candles.len());
 
@@ -305,6 +318,13 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
             daily_change_pct: 0.0,
             timestamp: Utc.timestamp_millis_opt(candle.timestamp).single().unwrap_or_else(Utc::now),
         };
+
+        let ema = match trend_ema {
+            Some(e) => e + trend_alpha * (candle.close - e),
+            None => candle.close,
+        };
+        trend_ema = Some(ema);
+        algo.on_trend_update(ema);
 
         for sig in algo.on_tick(&md) {
             sim.route_signal(&sig, bid, ask);
@@ -850,6 +870,30 @@ mod tests {
         ]);
         let report = run_backtest(&cfg(options, 0.0), &oscillation()).unwrap();
         assert_eq!(report.trades.len(), 0, "unfundable grid must not trade");
+    }
+
+    #[test]
+    fn trend_ema_fed_during_replay_never_strands_the_exit() {
+        // Falling-then-recovering market with the trend filter ON (default ema).
+        // The pre-plan/08 code gated the counter-sell on the trend at fill time:
+        // at the 90 fill price sits ~10% below the EMA, so the exit was
+        // suppressed and the inventory stranded. Exits are never trend-gated
+        // now, so the dip must round-trip: buy @90, counter-sell @100, PnL 10.
+        let candles = vec![
+            candle(1, 100.0, 100.0, 100.0, 100.0),
+            candle(2, 100.0, 90.0, 100.0, 90.0),
+            candle(3, 90.0, 100.0, 100.0, 90.0),
+        ];
+        let options = opt(&[("levels", "1"), ("qty", "1"), ("spacing", "10")]);
+        let mut c = cfg(options, 0.0);
+        c.start_base_balance = 0.0;
+        let report = run_backtest(&c, &candles).unwrap();
+        assert_eq!(report.trades.len(), 2, "expected buy + counter sell, got {}", report.trades.len());
+        assert!(
+            (report.realized_pnl_net - 10.0).abs() < 1e-9,
+            "expected round-trip PnL 10, got {}",
+            report.realized_pnl_net
+        );
     }
 
     #[test]

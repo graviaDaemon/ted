@@ -11,7 +11,7 @@ use tokio::time::Duration;
 
 use crate::algorithm::build_algorithm;
 use crate::api::MarketData;
-use crate::config::channels::{RunnerControl, RunnerMode};
+use crate::config::channels::{RunnerControl, RunnerMode, TuiEvent};
 use crate::config::config::Config;
 use crate::engine::{EngineHandle, channels::EngineEvent};
 use crate::storage::db::Db;
@@ -34,6 +34,46 @@ fn should_fetch_atr(algo_name: &str, options: &HashMap<String, String>) -> bool 
         && (options.contains_key("atr_period")
             || options.contains_key("atr_timeframe")
             || options.contains_key("atr_multiplier"))
+}
+
+fn should_refresh_trend(algo_name: &str, options: &HashMap<String, String>) -> bool {
+    algo_name == "grid"
+        && options
+            .get("trend_filter")
+            .map(|v| !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+}
+
+/// EMA of candle closes over `trend_ema_period` candles of `trend_timeframe`
+/// (plan/08 step 2) — the trend measure fed to the algorithm via
+/// `on_trend_update`, replacing the old per-tick EMA.
+async fn fetch_trend_ema(
+    engine: &EngineHandle,
+    symbol: &str,
+    options: &HashMap<String, String>,
+) -> Result<f64, String> {
+    let timeframe = options
+        .get("trend_timeframe")
+        .cloned()
+        .unwrap_or_else(|| "30m".to_string());
+    let period = options
+        .get("trend_ema_period")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(50);
+    let mut candles = engine
+        .fetch_candles(symbol.to_string(), timeframe, period)
+        .await?;
+    if candles.is_empty() {
+        return Err("no candles returned".to_string());
+    }
+    candles.sort_by_key(|c| c.timestamp);
+    let alpha = 2.0 / (period as f64 + 1.0);
+    let mut ema = candles[0].close;
+    for c in &candles[1..] {
+        ema += alpha * (c.close - ema);
+    }
+    Ok(ema)
 }
 
 async fn wait_for_wallet_event(
@@ -162,6 +202,11 @@ pub async fn run_runner(
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(256);
     engine.subscribe(symbol.clone(), event_tx).await;
 
+    // Evaluated before the initial ATR fetch injects `spacing` into the options
+    // (which would make `should_fetch_atr` read false afterwards).
+    let needs_atr = should_fetch_atr(&algo_name, &options);
+    let needs_trend = should_refresh_trend(&algo_name, &options);
+
     if mode != RunnerMode::Simulation {
         match wait_for_wallet_event(&mut event_rx, &mut options, &symbol).await {
             Ok(()) => {}
@@ -175,7 +220,7 @@ pub async fn run_runner(
             }
         }
 
-        if should_fetch_atr(&algo_name, &options) {
+        if needs_atr {
             let timeframe = options
                 .get("atr_timeframe")
                 .cloned()
@@ -318,15 +363,16 @@ pub async fn run_runner(
         );
     }
 
-    let atr_refresh_secs = config.startup_defaults.atr_refresh_mins * 60;
-    let mut atr_refresh_interval: Option<tokio::time::Interval> =
-        if should_fetch_atr(&algo_name, &options) {
-            let mut iv = tokio::time::interval(Duration::from_secs(atr_refresh_secs));
-            iv.tick().await;
-            Some(iv)
-        } else {
-            None
-        };
+    // One shared refresh interval drives both the ATR-derived spacing update and
+    // the candle-close trend EMA update (plan/08 step 2).
+    let refresh_secs = config.startup_defaults.atr_refresh_mins * 60;
+    let mut refresh_interval: Option<tokio::time::Interval> = if needs_atr || needs_trend {
+        let mut iv = tokio::time::interval(Duration::from_secs(refresh_secs));
+        iv.tick().await;
+        Some(iv)
+    } else {
+        None
+    };
 
     // Periodic high-frequency snapshots feed analytics/the future dashboard.
     // Skipped in Simulation, which models perfect instant fills and is not a
@@ -445,6 +491,22 @@ pub async fn run_runner(
         None => crate::logger::log_info(&src, "Risk: max drawdown halt disabled."),
     }
 
+    // Seed the trend filter at spawn (like the initial ATR fetch) so it isn't
+    // blind until the first refresh. On failure extensions stay allowed
+    // (warming-up behaviour) until a refresh succeeds.
+    if needs_trend && state.mode != RunnerMode::Simulation {
+        match fetch_trend_ema(&engine, &symbol, &options).await {
+            Ok(ema) => {
+                crate::logger::log_info(&src, &format!("Trend EMA initialised: {:.8}", ema));
+                state.algorithm.on_trend_update(ema);
+            }
+            Err(e) => crate::logger::log_warn(
+                &src,
+                &format!("Initial trend EMA fetch failed ({}) — extensions allowed until the first refresh.", e),
+            ),
+        }
+    }
+
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -453,6 +515,7 @@ pub async fn run_runner(
                         crate::logger::log(&src, "Engine shut down — saving state for resume, leaving orders resting.");
                         state.save_state();
                         engine.unsubscribe(symbol.clone()).await;
+                        crate::logger::notify_tui(TuiEvent::RunnerStopped { symbol: symbol.clone() });
                         break;
                     }
 
@@ -512,24 +575,35 @@ pub async fn run_runner(
             }
 
             _ = async {
-                match atr_refresh_interval.as_mut() {
+                match refresh_interval.as_mut() {
                     Some(iv) => { iv.tick().await; }
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                let timeframe = state.options.get("atr_timeframe").cloned().unwrap_or_else(|| "1h".to_string());
-                let period = state.options.get("atr_period").and_then(|v| v.parse::<usize>().ok()).unwrap_or(14);
-                let multiplier = state.options.get("atr_multiplier").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.5);
-                match engine.fetch_candles(state.symbol.clone(), timeframe.clone(), period).await {
-                    Ok(candles) => match crate::algorithm::atr::compute_atr(&candles, period) {
-                        Ok(atr) => {
-                            let new_spacing = atr * multiplier;
-                            crate::logger::log(&src, &format!("ATR refresh: {:.8} ×{:.2} → spacing {:.8}", atr, multiplier, new_spacing));
-                            state.algorithm.on_spacing_update(new_spacing);
+                if needs_atr {
+                    let timeframe = state.options.get("atr_timeframe").cloned().unwrap_or_else(|| "1h".to_string());
+                    let period = state.options.get("atr_period").and_then(|v| v.parse::<usize>().ok()).unwrap_or(14);
+                    let multiplier = state.options.get("atr_multiplier").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.5);
+                    match engine.fetch_candles(state.symbol.clone(), timeframe.clone(), period).await {
+                        Ok(candles) => match crate::algorithm::atr::compute_atr(&candles, period) {
+                            Ok(atr) => {
+                                let new_spacing = atr * multiplier;
+                                crate::logger::log(&src, &format!("ATR refresh: {:.8} ×{:.2} → spacing {:.8}", atr, multiplier, new_spacing));
+                                state.algorithm.on_spacing_update(new_spacing);
+                            }
+                            Err(e) => crate::logger::log(&src, &format!("ATR refresh: compute failed: {}", e)),
+                        },
+                        Err(e) => crate::logger::log(&src, &format!("ATR refresh: candle fetch failed: {}", e)),
+                    }
+                }
+                if needs_trend {
+                    match fetch_trend_ema(&engine, &state.symbol, &state.options).await {
+                        Ok(ema) => {
+                            crate::logger::log(&src, &format!("Trend refresh: candle EMA {:.8}", ema));
+                            state.algorithm.on_trend_update(ema);
                         }
-                        Err(e) => crate::logger::log(&src, &format!("ATR refresh: compute failed: {}", e)),
-                    },
-                    Err(e) => crate::logger::log(&src, &format!("ATR refresh: candle fetch failed: {}", e)),
+                        Err(e) => crate::logger::log(&src, &format!("Trend refresh: candle fetch failed: {}", e)),
+                    }
                 }
             }
 
@@ -549,6 +623,7 @@ pub async fn run_runner(
                         crate::logger::log(&src, "Control channel closed — saving state, leaving orders resting.");
                         state.save_state();
                         engine.unsubscribe(symbol.clone()).await;
+                        crate::logger::notify_tui(TuiEvent::RunnerStopped { symbol: symbol.clone() });
                         break;
                     }
 
@@ -556,6 +631,7 @@ pub async fn run_runner(
                         crate::logger::log(&src, "Shutdown — saving state for resume, leaving orders resting.");
                         state.save_state();
                         engine.unsubscribe(symbol.clone()).await;
+                        crate::logger::notify_tui(TuiEvent::RunnerStopped { symbol: symbol.clone() });
                         break;
                     }
 
@@ -564,6 +640,7 @@ pub async fn run_runner(
                         cancel_all_live_orders(&mut state, &engine).await;
                         state.clear_state();
                         engine.unsubscribe(symbol.clone()).await;
+                        crate::logger::notify_tui(TuiEvent::RunnerStopped { symbol: symbol.clone() });
                         break;
                     }
 

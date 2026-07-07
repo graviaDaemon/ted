@@ -61,8 +61,45 @@ impl Cli {
                     start_base: bt.start_base,
                 })
             }
+            RunCommand::Sweep(sw) => {
+                let spacings = match &sw.spacings {
+                    Some(csv) => Some(parse_csv_list::<f64>(csv, "spacings")?),
+                    None => None,
+                };
+                let levels = parse_csv_list::<u32>(&sw.levels, "levels")?;
+                Ok(CliAction::Sweep {
+                    symbol: sw.symbol.clone(),
+                    timeframe: sw.timeframe.clone(),
+                    limit: sw.limit,
+                    from_file: sw.from_file.clone(),
+                    spacings,
+                    levels,
+                    capital: sw.capital,
+                    spread: sw.spread,
+                    maker_fee: sw.maker_fee,
+                    taker_fee: sw.taker_fee,
+                    start_quote: sw.start_quote,
+                    start_base: sw.start_base,
+                })
+            }
             RunCommand::Exit => Ok(CliAction::Exit),
         }
+    }
+}
+
+fn parse_csv_list<T: std::str::FromStr>(
+    raw: &str,
+    what: &str,
+) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+    let values: Result<Vec<T>, _> = raw
+        .split(',')
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.parse::<T>())
+        .collect();
+    match values {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(format!("Invalid --{} '{}': expected a comma-separated list of numbers", what, raw).into()),
     }
 }
 
@@ -82,6 +119,7 @@ pub enum RunCommand {
     Runner(RunnerCommand),
     Generate(GenerateCommand),
     Backtest(BacktestCommand),
+    Sweep(SweepCommand),
     Exit,
 }
 
@@ -167,6 +205,49 @@ pub struct BacktestCommand {
     pub start_base: f64,
 }
 
+#[derive(Args, Debug)]
+pub struct SweepCommand {
+    #[arg(short = 's', long)]
+    pub symbol: String,
+
+    #[arg(short = 't', long, default_value = "30m")]
+    pub timeframe: String,
+
+    #[arg(short = 'l', long, default_value_t = 3000)]
+    pub limit: usize,
+
+    #[arg(long, value_name = "PATH")]
+    pub from_file: Option<String>,
+
+    /// Comma-separated spacing candidates; derived from the candle set's ATR
+    /// when omitted.
+    #[arg(long, value_name = "CSV")]
+    pub spacings: Option<String>,
+
+    #[arg(long, value_name = "CSV", default_value = "2,3,4,6")]
+    pub levels: String,
+
+    /// Quote budget each combination sizes from; defaults to --start-quote.
+    #[arg(long)]
+    pub capital: Option<f64>,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub spread: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub maker_fee: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub taker_fee: f64,
+
+    /// Starting quote wallet for the replay; defaults to --capital.
+    #[arg(long)]
+    pub start_quote: Option<f64>,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub start_base: f64,
+}
+
 pub enum CliAction {
     Spawn {
         symbol: String,
@@ -206,6 +287,20 @@ pub enum CliAction {
         maker_fee: f64,
         taker_fee: f64,
         start_quote: f64,
+        start_base: f64,
+    },
+    Sweep {
+        symbol: String,
+        timeframe: String,
+        limit: usize,
+        from_file: Option<String>,
+        spacings: Option<Vec<f64>>,
+        levels: Vec<u32>,
+        capital: Option<f64>,
+        spread: f64,
+        maker_fee: f64,
+        taker_fee: f64,
+        start_quote: Option<f64>,
         start_base: f64,
     },
     Exit,

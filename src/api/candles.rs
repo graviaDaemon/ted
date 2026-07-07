@@ -1,6 +1,7 @@
 use crate::config::config::Config;
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct Candle {
     pub timestamp: i64,
     pub open: f64,

@@ -1,3 +1,4 @@
+use crate::config::channels::TuiEvent;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -47,7 +48,7 @@ struct LogState {
 
 static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
-static TICKER_TX: OnceLock<Sender<(String, f64)>> = OnceLock::new();
+static TUI_TX: OnceLock<Sender<TuiEvent>> = OnceLock::new();
 static MIN_LEVEL: OnceLock<LogLevel> = OnceLock::new();
 
 fn logs_dir() -> PathBuf {
@@ -117,13 +118,17 @@ pub fn init(tx: Sender<String>, retention: u32, min_level: LogLevel) -> io::Resu
     Ok(())
 }
 
-pub fn init_ticker(tx: Sender<(String, f64)>) {
-    let _ = TICKER_TX.set(tx);
+pub fn init_tui_events(tx: Sender<TuiEvent>) {
+    let _ = TUI_TX.set(tx);
 }
 
 pub fn update_ticker(symbol: String, bid: f64) {
-    if let Some(tx) = TICKER_TX.get() {
-        let _ = tx.try_send((symbol, bid));
+    notify_tui(TuiEvent::Ticker { symbol, bid });
+}
+
+pub fn notify_tui(event: TuiEvent) {
+    if let Some(tx) = TUI_TX.get() {
+        let _ = tx.try_send(event);
     }
 }
 

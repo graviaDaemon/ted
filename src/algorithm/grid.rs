@@ -1,8 +1,11 @@
 use crate::algorithm::Algorithm;
 use crate::algorithm::position::AvgCostBook;
 use crate::api::{MarketData, TradeSignal};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+const REBUILD_COOLDOWN_SECS: i64 = 300;
 
 #[derive(Clone, Copy, PartialEq)]
 enum TrendFilter {
@@ -26,7 +29,8 @@ struct GridState {
     total_sells: u32,
     spacing: f64,
     price_decimals: u32,
-    ema: Option<f64>,
+    #[serde(default, alias = "ema")]
+    trend_ema: Option<f64>,
     last_price: Option<f64>,
     unprofitable: bool,
     emitted_buy_prices: HashSet<u64>,
@@ -40,6 +44,10 @@ struct GridState {
 
 pub struct GridBot {
     levels_per_side: u32,
+    // The level count the user asked for. `levels_per_side` is the effective
+    // count derived each sizing pass, so a budget-capped reduction is
+    // non-destructive and a grown budget can restore levels later.
+    levels_requested: u32,
     qty: f64,
     spacing: f64,
     price_decimals: u32,
@@ -77,10 +85,15 @@ pub struct GridBot {
     trend_filter: TrendFilter,
     trend_ema_period: f64,
     trend_threshold: f64,
-    ema: Option<f64>,
+    // Candle-close EMA pushed in by the runner/backtester via `on_trend_update`
+    // (plan/08 step 2) — not derived from ticks.
+    trend_ema: Option<f64>,
 
     max_position: f64,
     stop_loss_pct: Option<f64>,
+
+    recenter_band: f64,
+    last_rebuild_at: Option<DateTime<Utc>>,
 
     emitted_buy_prices: HashSet<u64>,
     emitted_sell_prices: HashSet<u64>,
@@ -204,7 +217,13 @@ impl GridBot {
         let trend_threshold = options
             .get("trend_threshold")
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(0.005);
+
+        let recenter_band = options
+            .get("recenter_band")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(2.5);
 
         let max_position = options
             .get("max_position")
@@ -219,6 +238,7 @@ impl GridBot {
 
         Ok(GridBot {
             levels_per_side,
+            levels_requested: levels_per_side,
             qty,
             spacing,
             price_decimals,
@@ -246,9 +266,11 @@ impl GridBot {
             trend_filter,
             trend_ema_period,
             trend_threshold,
-            ema: None,
+            trend_ema: None,
             max_position,
             stop_loss_pct,
+            recenter_band,
+            last_rebuild_at: None,
             emitted_buy_prices: HashSet::new(),
             emitted_sell_prices: HashSet::new(),
         })
@@ -261,7 +283,7 @@ impl GridBot {
     fn trend_label(&self) -> &'static str {
         match self.trend_filter {
             TrendFilter::Off => "off",
-            TrendFilter::Ema => match (self.ema, self.last_price) {
+            TrendFilter::Ema => match (self.trend_ema, self.last_price) {
                 (Some(ema), Some(price)) if ema > 0.0 => {
                     let dev = (price - ema) / ema;
                     if dev > self.trend_threshold {
@@ -277,39 +299,24 @@ impl GridBot {
         }
     }
 
-    /// True when the strategy may place new buy orders: inside inventory cap,
-    /// not stopped out, and not fighting a strong uptrend.
-    fn buys_enabled(&self, price: f64) -> bool {
-        if self.book.position >= self.max_position {
-            return false;
-        }
-        if self.stopped_out(price) {
-            return false;
-        }
-        match self.trend_filter {
-            TrendFilter::Off => true,
-            TrendFilter::Ema => match self.ema {
-                Some(ema) if ema > 0.0 => (price - ema) / ema <= self.trend_threshold,
-                _ => true,
-            },
-        }
+    /// True when the strategy may add buy exposure: inside inventory cap and not
+    /// stopped out. Counter-buys and planned ladder levels are gated by this
+    /// alone — never by the trend filter (plan/08 step 1).
+    fn risk_allows_buy(&self, price: f64) -> bool {
+        self.book.position < self.max_position && !self.stopped_out(price)
     }
 
-    /// True when the strategy may place new sell orders: inside inventory cap,
-    /// not stopped out, and not fighting a strong downtrend.
-    fn sells_enabled(&self, price: f64) -> bool {
-        if self.book.position <= -self.max_position {
+    /// True when the trend filter forbids *extending* the buy ladder: the trend
+    /// EMA is known and price sits below it beyond the threshold (a real
+    /// downtrend). The only move this blocks is adding fresh exposure below the
+    /// ladder into a falling market; exits are never trend-gated.
+    fn trend_blocks_extension_buy(&self, price: f64) -> bool {
+        if self.trend_filter != TrendFilter::Ema {
             return false;
         }
-        if self.stopped_out(price) {
-            return false;
-        }
-        match self.trend_filter {
-            TrendFilter::Off => true,
-            TrendFilter::Ema => match self.ema {
-                Some(ema) if ema > 0.0 => (price - ema) / ema >= -self.trend_threshold,
-                _ => true,
-            },
+        match self.trend_ema {
+            Some(ema) if ema > 0.0 => (price - ema) / ema < -self.trend_threshold,
+            _ => false,
         }
     }
 
@@ -323,17 +330,6 @@ impl GridBot {
             }
             _ => false,
         }
-    }
-
-    fn update_ema(&mut self, price: f64) {
-        if self.trend_filter == TrendFilter::Off {
-            return;
-        }
-        let alpha = 2.0 / (self.trend_ema_period + 1.0);
-        self.ema = Some(match self.ema {
-            Some(e) => e + alpha * (price - e),
-            None => price,
-        });
     }
 
     fn price_key(&self, price: f64) -> u64 {
@@ -358,12 +354,14 @@ impl GridBot {
         (qty * 1e8).floor() / 1e8
     }
 
-    /// Derive a uniform per-level `qty` from the `capital` quote budget at the
-    /// given midpoint (plan/06 step 1). Reserves `buy_reserve_frac` of capital to
-    /// fund the buy ladder; reduces `levels_per_side` so each level clears
-    /// `min_notional`; caps `qty` by held base so the sell ladder is fundable too.
-    /// Flags the runner `unfundable` (and warns) if the budget cannot fund even one
-    /// level at `min_notional`.
+    /// Derive a uniform per-level `qty` from the effective quote budget at the
+    /// given midpoint (plan/06 step 1). The budget compounds net realized PnL
+    /// (plan/08 step 4): profits grow it, losses shrink it, clamped at zero.
+    /// Reserves `buy_reserve_frac` to fund the buy ladder; derives the effective
+    /// `levels_per_side` from `levels_requested` so each level clears
+    /// `min_notional` (non-destructive — a grown budget restores levels); caps
+    /// `qty` by held base so the sell ladder is fundable too. Flags the runner
+    /// `unfundable` (and warns) if the budget cannot fund even one level.
     fn size_from_capital(&mut self, midpoint: f64) {
         let Some(capital) = self.capital else {
             return;
@@ -372,7 +370,8 @@ impl GridBot {
             return;
         }
 
-        let buy_budget = capital * self.buy_reserve_frac;
+        let effective = (capital + self.book.realized_pnl).max(0.0);
+        let buy_budget = effective * self.buy_reserve_frac;
         // Each level costs ~ buy_budget / levels in quote; cap levels so that
         // per-level notional stays >= min_notional.
         let max_fundable = (buy_budget / self.min_notional).floor() as u32;
@@ -382,24 +381,24 @@ impl GridBot {
             crate::logger::log_warn(
                 "[GRID]",
                 &format!(
-                    "Capital {:.2} (buy budget {:.2} = capital × {:.2}) cannot fund a single level at min_notional {:.2} — emitting no orders. Increase capital or lower min_notional.",
-                    capital, buy_budget, self.buy_reserve_frac, self.min_notional
+                    "Budget {:.2} (capital {:.2} + realized {:+.2}; buy budget {:.2} = budget × {:.2}) cannot fund a single level at min_notional {:.2} — emitting no orders. Increase capital or lower min_notional.",
+                    effective, capital, self.book.realized_pnl, buy_budget, self.buy_reserve_frac, self.min_notional
                 ),
             );
             return;
         }
 
-        let levels = self.levels_per_side.min(max_fundable);
-        if levels < self.levels_per_side {
+        let levels = self.levels_requested.min(max_fundable);
+        if levels < self.levels_requested {
             crate::logger::log_warn(
                 "[GRID]",
                 &format!(
-                    "Capital {:.2} (buy budget {:.2}) funds only {} of {} requested levels/side at min_notional {:.2} — reducing to {}.",
-                    capital, buy_budget, levels, self.levels_per_side, self.min_notional, levels
+                    "Budget {:.2} (buy budget {:.2}) funds only {} of {} requested levels/side at min_notional {:.2} — reducing to {}.",
+                    effective, buy_budget, levels, self.levels_requested, self.min_notional, levels
                 ),
             );
-            self.levels_per_side = levels;
         }
+        self.levels_per_side = levels;
 
         let qty_from_quote = buy_budget / (levels as f64 * midpoint);
         let qty = if self.initial_base_balance > 0.0 {
@@ -429,8 +428,10 @@ impl GridBot {
         crate::logger::log_info(
             "[GRID]",
             &format!(
-                "Sized from capital {:.2}: qty {:.8}/level × {} levels/side (buy budget {:.2}, reserve {:.0}% for buys, midpoint {:.2}).",
+                "Sized from capital {:.2} + realized {:+.2} → budget {:.2}: qty {:.8}/level × {} levels/side (buy budget {:.2}, reserve {:.0}% for buys, midpoint {:.2}).",
                 capital,
+                self.book.realized_pnl,
+                effective,
                 qty,
                 self.levels_per_side,
                 buy_budget,
@@ -584,6 +585,58 @@ impl GridBot {
     fn grid_upper(&self) -> Option<f64> {
         self.sell_orders.values().copied().reduce(f64::max)
     }
+
+    fn format_range(lower: Option<f64>, upper: Option<f64>) -> String {
+        let side = |v: Option<f64>, name: &str| {
+            v.map(|p| format!("{:.2}", p))
+                .unwrap_or_else(|| format!("no {}", name))
+        };
+        format!("[{}–{}]", side(lower, "buys"), side(upper, "sells"))
+    }
+
+    /// Drain every tracked level into `Cancel` signals so a rebuild does not
+    /// orphan the resting exchange orders (plan/08 step 3). Callers prepend
+    /// these to `build_grid`'s output.
+    fn drain_to_cancels(&mut self) -> Vec<TradeSignal> {
+        let prec = self.price_decimals as usize;
+        let mut signals: Vec<TradeSignal> =
+            Vec::with_capacity(self.buy_orders.len() + self.sell_orders.len());
+        for price in self.buy_orders.values().copied() {
+            signals.push(TradeSignal::Cancel {
+                price,
+                is_buy: true,
+                reason: format!("Rebuild: cancel stale buy {:.prec$}", price, prec = prec),
+            });
+        }
+        for price in self.sell_orders.values().copied() {
+            signals.push(TradeSignal::Cancel {
+                price,
+                is_buy: false,
+                reason: format!("Rebuild: cancel stale sell {:.prec$}", price, prec = prec),
+            });
+        }
+        self.buy_orders.clear();
+        self.sell_orders.clear();
+        self.emitted_buy_prices.clear();
+        self.emitted_sell_prices.clear();
+        signals
+    }
+
+    /// True when no grid level on either side rests within
+    /// `recenter_band × spacing` of the mid — the fill-less deadlock plan/08
+    /// step 3 re-centers out of. Not triggered while a side still has a level
+    /// near enough to fill.
+    fn in_dead_zone(&self, mid: f64) -> bool {
+        let band = self.recenter_band * self.spacing;
+        let near = |orders: &HashMap<u64, f64>| orders.values().any(|&p| (p - mid).abs() <= band);
+        !near(&self.buy_orders) && !near(&self.sell_orders)
+    }
+
+    fn rebuild_cooldown_active(&self, now: DateTime<Utc>) -> bool {
+        self.last_rebuild_at
+            .map(|t| now - t < chrono::Duration::seconds(REBUILD_COOLDOWN_SECS))
+            .unwrap_or(false)
+    }
 }
 
 impl Algorithm for GridBot {
@@ -593,19 +646,16 @@ impl Algorithm for GridBot {
 
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal> {
         let price = (tick.bid + tick.ask) / 2.0;
-        self.update_ema(price);
 
         if self.last_price.is_none() {
             if !self.buy_orders.is_empty() || !self.sell_orders.is_empty() {
-                let lower = self.grid_lower().unwrap_or(f64::MIN);
-                let upper = self.grid_upper().unwrap_or(f64::MAX);
-                if price >= lower && price <= upper {
+                let lower = self.grid_lower();
+                let upper = self.grid_upper();
+                let range = Self::format_range(lower, upper);
+                if price >= lower.unwrap_or(f64::MIN) && price <= upper.unwrap_or(f64::MAX) {
                     crate::logger::log(
                         "[GRID]",
-                        &format!(
-                            "Soft resume at {:.2} — grid [{:.2}–{:.2}] intact.",
-                            price, lower, upper
-                        ),
+                        &format!("Soft resume at {:.2} — grid {} intact.", price, range),
                     );
                     self.last_price = Some(price);
                     return vec![];
@@ -613,24 +663,31 @@ impl Algorithm for GridBot {
                 crate::logger::log(
                     "[GRID]",
                     &format!(
-                        "Price {:.2} outside preserved grid [{:.2}–{:.2}] — rebuilding.",
-                        price, lower, upper
+                        "Price {:.2} outside preserved grid {} — rebuilding.",
+                        price, range
                     ),
                 );
-                self.buy_orders.clear();
-                self.sell_orders.clear();
+                let mut signals = self.drain_to_cancels();
+                signals.extend(self.build_grid(price));
+                self.last_rebuild_at = Some(tick.timestamp);
+                self.last_price = Some(price);
+                return signals;
             }
 
             let signals = self.build_grid(price);
             if signals.is_empty() {
                 return vec![];
             }
+            self.last_rebuild_at = Some(tick.timestamp);
             self.last_price = Some(price);
             return signals;
         }
 
         if self.buy_orders.is_empty() && self.sell_orders.is_empty() {
             let signals = self.build_grid(price);
+            if !signals.is_empty() {
+                self.last_rebuild_at = Some(tick.timestamp);
+            }
             self.last_price = Some(price);
             return signals;
         }
@@ -645,9 +702,32 @@ impl Algorithm for GridBot {
                     price, self.grid_lower_bound, self.grid_upper_bound
                 ),
             );
-            self.buy_orders.clear();
-            self.sell_orders.clear();
-            let signals = self.build_grid(price);
+            let mut signals = self.drain_to_cancels();
+            self.sized = false;
+            signals.extend(self.build_grid(price));
+            self.last_rebuild_at = Some(tick.timestamp);
+            self.last_price = Some(price);
+            return signals;
+        }
+
+        // Fill-less re-centering (plan/08 step 3): a stalled grid whose nearest
+        // level on both sides drifted outside the band can never slide on fills
+        // again — cancel the stale ladder and rebuild around the mid. The
+        // cooldown stops a fast wick from thrashing cancel/replace cycles.
+        if self.in_dead_zone(price) && !self.rebuild_cooldown_active(tick.timestamp) {
+            crate::logger::log(
+                "[GRID]",
+                &format!(
+                    "No grid level within {:.1} × spacing of mid {:.2} ({}) — re-centering.",
+                    self.recenter_band,
+                    price,
+                    Self::format_range(self.grid_lower(), self.grid_upper()),
+                ),
+            );
+            let mut signals = self.drain_to_cancels();
+            self.sized = false;
+            signals.extend(self.build_grid(price));
+            self.last_rebuild_at = Some(tick.timestamp);
             self.last_price = Some(price);
             return signals;
         }
@@ -656,7 +736,7 @@ impl Algorithm for GridBot {
         let mut signals: Vec<TradeSignal> = Vec::new();
         let prec = self.price_decimals as usize;
 
-        if price > prev_price && self.sells_enabled(price) {
+        if price > prev_price {
             let triggered: Vec<(u64, f64)> = self
                 .sell_orders
                 .iter()
@@ -672,7 +752,7 @@ impl Algorithm for GridBot {
                     price_decimals: self.price_decimals,
                 });
             }
-        } else if price < prev_price && self.buys_enabled(price) {
+        } else if price < prev_price && self.risk_allows_buy(price) {
             let triggered: Vec<(u64, f64)> = self
                 .buy_orders
                 .iter()
@@ -725,7 +805,10 @@ impl Algorithm for GridBot {
                 });
             }
 
-            if self.sells_enabled(current_price) && self.can_place_sell() {
+            // Counter-sell: the exit leg of the round trip. Reduces exposure, so
+            // it is gated only by the no-short inventory check — never by the
+            // trend filter or stop (plan/08 step 1).
+            if self.can_place_sell() {
                 let counter = ((current_price + self.spacing) * m).round() / m;
                 self.sell_orders.insert(self.price_key(counter), counter);
                 crate::logger::log(
@@ -745,7 +828,11 @@ impl Algorithm for GridBot {
                 });
             }
 
-            if self.buys_enabled(current_price) {
+            // Extension buy: fresh exposure below the ladder — the one move the
+            // trend filter gates (only against a real downtrend).
+            if self.risk_allows_buy(current_price)
+                && !self.trend_blocks_extension_buy(current_price)
+            {
                 let lowest_buy = self
                     .buy_orders
                     .values()
@@ -785,7 +872,9 @@ impl Algorithm for GridBot {
                 });
             }
 
-            if self.buys_enabled(current_price) {
+            // Counter-buy: re-arms the ladder for the next round trip. Gated by
+            // the risk checks only — never by the trend filter (plan/08 step 1).
+            if self.risk_allows_buy(current_price) {
                 let counter = ((current_price - self.spacing) * m).round() / m;
                 if counter > 0.0 {
                     self.buy_orders.insert(self.price_key(counter), counter);
@@ -816,7 +905,7 @@ impl Algorithm for GridBot {
                 }
             }
 
-            if self.sells_enabled(current_price) && self.can_place_sell() {
+            if self.can_place_sell() {
                 let highest_sell = self
                     .sell_orders
                     .values()
@@ -858,6 +947,12 @@ impl Algorithm for GridBot {
         crate::logger::log("[GRID]", &format!("Spacing updated: {:.8}", new_spacing));
     }
 
+    fn on_trend_update(&mut self, ema: f64) {
+        if ema > 0.0 {
+            self.trend_ema = Some(ema);
+        }
+    }
+
     fn on_reconnect(&mut self) {
         self.last_price = None;
         self.emitted_buy_prices.clear();
@@ -868,13 +963,13 @@ impl Algorithm for GridBot {
                 "Reconnected — no grid built yet, will initialise on next tick.",
             );
         } else {
-            let lower = self.grid_lower().unwrap_or(0.0);
-            let upper = self.grid_upper().unwrap_or(0.0);
             crate::logger::log(
                 "[GRID]",
                 &format!(
-                    "Reconnected — grid preserved ({} buys, {} sells, range ~{:.2}–{:.2}), resuming on next tick.",
-                    self.buy_orders.len(), self.sell_orders.len(), lower, upper
+                    "Reconnected — grid preserved ({} buys, {} sells, range ~{}), resuming on next tick.",
+                    self.buy_orders.len(),
+                    self.sell_orders.len(),
+                    Self::format_range(self.grid_lower(), self.grid_upper()),
                 ),
             );
         }
@@ -915,7 +1010,7 @@ impl Algorithm for GridBot {
             total_sells: self.total_sells,
             spacing: self.spacing,
             price_decimals: self.price_decimals,
-            ema: self.ema,
+            trend_ema: self.trend_ema,
             last_price: self.last_price,
             unprofitable: self.unprofitable,
             emitted_buy_prices: self.emitted_buy_prices.clone(),
@@ -949,7 +1044,7 @@ impl Algorithm for GridBot {
         self.total_sells = state.total_sells;
         self.spacing = state.spacing;
         self.price_decimals = state.price_decimals;
-        self.ema = state.ema;
+        self.trend_ema = state.trend_ema;
         self.last_price = state.last_price;
         self.unprofitable = state.unprofitable;
         self.emitted_buy_prices = state.emitted_buy_prices;
@@ -1105,25 +1200,39 @@ mod tests {
     }
 
     #[test]
-    fn trend_up_suppresses_new_buys_flat_allows_them() {
-        let o = opts(&[
-            ("levels", "3"),
-            ("qty", "1"),
-            ("spacing", "10"),
-            ("trend_threshold", "0.0"),
-        ]);
+    fn downtrend_places_counter_sell_but_blocks_extension_buy() {
+        // Regression for runner 40: 6 buy fills down a falling market produced
+        // zero counter-sells because exits were trend-gated at fill time.
+        let o = opts(&[("levels", "3"), ("qty", "1"), ("spacing", "10")]);
+        let mut g = GridBot::new(&o).unwrap();
+        assert!((g.trend_threshold - 0.005).abs() < 1e-12, "default threshold");
+        g.on_trend_update(100.0);
+        // Fill at 90 = 10% below the trend EMA — a real downtrend.
+        let sigs = g.on_fill(90.0, true, 90.0);
+        assert_eq!(count_sells(&sigs), 1, "counter sell must always follow a buy fill");
+        assert!(!has_buy(&sigs), "extension buy blocked in a downtrend");
+    }
 
-        // Uptrend: current price above EMA → no new buy on a sell fill.
-        let mut up = GridBot::new(&o).unwrap();
-        up.ema = Some(100.0);
-        let sigs = up.on_fill(110.0, false, 110.0);
-        assert!(!has_buy(&sigs), "uptrend should suppress new buys");
+    #[test]
+    fn uptrend_places_counter_buy() {
+        // Regression for runner 41: 4 sell fills up a rally produced zero
+        // counter-buys, so the ladder never re-armed.
+        let o = opts(&[("levels", "3"), ("qty", "1"), ("spacing", "10")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.on_fill(100.0, true, 100.0); // acquire inventory to sell
+        g.on_trend_update(100.0);
+        // Fill at 110 = 10% above the trend EMA — a real uptrend.
+        let sigs = g.on_fill(110.0, false, 110.0);
+        assert!(has_buy(&sigs), "counter buy must always follow a sell fill");
+    }
 
-        // Flat: current price equals EMA → counter buy is emitted.
-        let mut flat = GridBot::new(&o).unwrap();
-        flat.ema = Some(110.0);
-        let sigs = flat.on_fill(110.0, false, 110.0);
-        assert!(has_buy(&sigs), "flat trend should allow new buys");
+    #[test]
+    fn unknown_trend_allows_extension_buys() {
+        let o = opts(&[("levels", "3"), ("qty", "1"), ("spacing", "10")]);
+        let mut g = GridBot::new(&o).unwrap();
+        // No trend EMA yet (warming up) → extensions are allowed.
+        let sigs = g.on_fill(90.0, true, 90.0);
+        assert!(has_buy(&sigs), "warming-up filter must not block extensions");
     }
 
     #[test]
@@ -1298,5 +1407,105 @@ mod tests {
         assert_eq!(restored.levels_per_side, g.levels_per_side);
         assert!(restored.sized && restored.base_seeded);
         assert!((restored.book.position - g.book.position).abs() < 1e-9);
+    }
+
+    fn tick(price: f64, ts_secs: i64) -> MarketData {
+        use chrono::TimeZone;
+        MarketData {
+            symbol: "TESTUSD".to_string(),
+            bid: price,
+            bid_size: 0.0,
+            ask: price,
+            ask_size: 0.0,
+            last_price: price,
+            volume: 0.0,
+            high: price,
+            low: price,
+            daily_change: 0.0,
+            daily_change_pct: 0.0,
+            timestamp: chrono::Utc.timestamp_opt(ts_secs, 0).single().unwrap(),
+        }
+    }
+
+    fn count_cancels(signals: &[TradeSignal]) -> usize {
+        signals.iter().filter(|s| matches!(s, TradeSignal::Cancel { .. })).count()
+    }
+
+    #[test]
+    fn dead_zone_recenters_with_cancels_then_respects_cooldown() {
+        // spacing 1, levels 2 → buys at 99/98, no sells (no held base). Mid 105
+        // is inside the ×0.95/×1.05 far-outside bounds but > 2.5 × spacing from
+        // every level: the pre-plan/08 deadlock (no fill → no slide → no fill).
+        let o = opts(&[("levels", "2"), ("qty", "1"), ("spacing", "1"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        assert!(g.on_tick(&tick(105.0, 0)).is_empty(), "first tick soft-resumes");
+
+        let sigs = g.on_tick(&tick(105.0, 10));
+        assert_eq!(count_cancels(&sigs), 2, "both stale buys cancelled");
+        assert!(has_buy(&sigs), "fresh ladder built around mid");
+
+        // Drift into another dead zone inside the cooldown → no rebuild.
+        let sigs = g.on_tick(&tick(110.0, 20));
+        assert_eq!(count_cancels(&sigs), 0, "no rebuild within cooldown");
+
+        // After the cooldown elapses the re-center fires.
+        let sigs = g.on_tick(&tick(110.0, 10 + REBUILD_COOLDOWN_SECS + 1));
+        assert!(count_cancels(&sigs) > 0, "re-center after cooldown");
+    }
+
+    #[test]
+    fn no_recenter_while_a_level_is_near() {
+        let o = opts(&[("levels", "2"), ("qty", "1"), ("spacing", "1"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0); // buys at 99/98
+        g.on_tick(&tick(100.0, 0));
+        // 100.5 is within 2.5 × spacing of the 99 buy → grid is workable, no rebuild.
+        let sigs = g.on_tick(&tick(100.5, 10));
+        assert_eq!(count_cancels(&sigs), 0, "near level must suppress re-center");
+    }
+
+    #[test]
+    fn rebuild_resizes_with_net_realized_pnl() {
+        // capital 600, reserve 0.5, levels 3 @ mid 100 → qty 1. With +60 net
+        // realized, a re-size derives from budget 660 → qty 1.1 (compounding).
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        assert!((g.qty - 1.0).abs() < 1e-9, "baseline qty {}", g.qty);
+
+        g.book.realized_pnl = 60.0;
+        g.sized = false;
+        g.build_grid(100.0);
+        assert!((g.qty - 1.1).abs() < 1e-9, "compounded qty {}", g.qty);
+    }
+
+    #[test]
+    fn losses_beyond_budget_clamp_to_unfundable() {
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+
+        // Effective budget 600 − 560 = 40 → buy budget 20 < min_notional 25.
+        g.book.realized_pnl = -560.0;
+        g.sized = false;
+        let sigs = g.build_grid(100.0);
+        assert!(sigs.is_empty(), "shrunk budget must emit no orders");
+        assert!(g.unfundable);
+    }
+
+    #[test]
+    fn levels_recover_when_budget_grows() {
+        // buy budget 60 funds 2 of 6 requested levels; +180 realized grows the
+        // budget to 300 (buy budget 150) → all 6 levels restored.
+        let o = opts(&[("levels", "6"), ("capital", "120"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        assert_eq!(g.levels_per_side, 2, "budget-capped level count");
+
+        g.book.realized_pnl = 180.0;
+        g.sized = false;
+        g.build_grid(100.0);
+        assert_eq!(g.levels_per_side, 6, "grown budget must restore levels");
     }
 }

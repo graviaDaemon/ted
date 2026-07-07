@@ -12,6 +12,10 @@ pub trait Algorithm: Send {
     fn on_order_failed(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
     fn on_spacing_update(&mut self, _new_spacing: f64) {}
+    /// Push a fresh candle-close trend EMA into the strategy. Fed by the
+    /// runner's periodic candle refresh live and by the backtester per candle,
+    /// so both paths exercise the same trend filter.
+    fn on_trend_update(&mut self, _ema: f64) {}
     fn on_balance_update(&mut self, _base: f64, _quote: f64) {}
     fn summary(&self) -> Option<String> {
         None

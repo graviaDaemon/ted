@@ -35,3 +35,4 @@ DEPLOY.md
 *.jsonl
 tickers.json
 ted.log
+requests/history/**

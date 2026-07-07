@@ -1,5 +1,5 @@
 use crate::algorithm::Algorithm;
-use crate::config::channels::RunnerMode;
+use crate::config::channels::{RunnerMode, TuiEvent};
 use crate::config::config::Config;
 use crate::runner::trade_log::TradeLog;
 use crate::storage::db::{DailyRollup, Db, FillRow, RunnerStateRow, SnapshotRow};
@@ -55,6 +55,14 @@ impl RunnerState {
         qty: f64,
         realized_pnl: Option<f64>,
     ) {
+        crate::logger::notify_tui(TuiEvent::Fill {
+            symbol: self.symbol.clone(),
+            is_buy,
+            qty,
+            price,
+            realized_pnl,
+            ts: Utc::now(),
+        });
         if let (Some(db), Some(runner_id)) = (&self.db, self.runner_db_id) {
             let _ = db.insert_fill(&FillRow {
                 runner_id,
@@ -111,14 +119,10 @@ impl RunnerState {
     /// Write a high-frequency snapshot row and upsert the current UTC day's
     /// rollup. No-op until a price is known. Intraday restarts rebase the day's
     /// starting point, so a rollup can under-count a day across restarts;
-    /// `fills` remains the exact source of truth for PnL.
+    /// `fills` remains the exact source of truth for PnL. Also emits the
+    /// periodic `TuiEvent::Status`, which must not be lost when no DB row
+    /// exists.
     pub fn persist_periodic(&mut self) {
-        let Some(runner_id) = self.runner_db_id else {
-            return;
-        };
-        if self.db.is_none() {
-            return;
-        }
         let mid = if self.last_bid > 0.0 && self.last_ask > 0.0 {
             (self.last_bid + self.last_ask) / 2.0
         } else {
@@ -133,6 +137,26 @@ impl RunnerState {
         let (_, quote) = extract_currencies(&self.symbol);
         let quote_bal = self.wallet_balances.get(&quote).copied().unwrap_or(0.0);
         let equity = quote_bal + position * mid;
+
+        crate::logger::notify_tui(TuiEvent::Status {
+            symbol: self.symbol.clone(),
+            mode: crate::runner::mode_label(&self.mode).to_string(),
+            realized,
+            unrealized,
+            equity,
+            position,
+            open_buys: self.pending_buy_orders.len(),
+            open_sells: self.pending_sell_orders.len(),
+            paused: self.paused,
+            halted: self.halted,
+        });
+
+        let Some(runner_id) = self.runner_db_id else {
+            return;
+        };
+        if self.db.is_none() {
+            return;
+        }
 
         let now = Utc::now();
         let ts = now.to_rfc3339();

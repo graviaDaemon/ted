@@ -12,6 +12,16 @@ pub struct FillRow {
     pub filled_at: String,
 }
 
+/// A fill joined to its runner's symbol, for the TUI last-trades preload.
+pub struct RecentFill {
+    pub symbol: String,
+    pub direction: String,
+    pub price: f64,
+    pub quantity: f64,
+    pub realized_pnl: Option<f64>,
+    pub filled_at: String,
+}
+
 /// High-frequency per-runner sample. Pruned after `snapshot_retention_days`.
 pub struct SnapshotRow {
     pub runner_id: i64,
@@ -170,6 +180,27 @@ impl Db {
         rows.collect()
     }
 
+    /// Most recent fills across all runners, newest first, joined to the
+    /// runner's symbol. Feeds the TUI last-trades preload at startup.
+    pub fn recent_fills(&self, limit: u32) -> Result<Vec<RecentFill>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.symbol, f.direction, f.price, f.quantity, f.realized_pnl, f.filled_at \
+             FROM fills f JOIN runners r ON r.id = f.runner_id \
+             ORDER BY f.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(RecentFill {
+                symbol: row.get(0)?,
+                direction: row.get(1)?,
+                price: row.get(2)?,
+                quantity: row.get(3)?,
+                realized_pnl: row.get(4)?,
+                filled_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn insert_snapshot(&self, row: &SnapshotRow) -> Result<i64, rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO snapshots (runner_id, ts, mid, bid, ask, position, realized_pnl, unrealized_pnl, open_buys, open_sells, equity) \
@@ -287,6 +318,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
+            CREATE TABLE runners (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+                algorithm TEXT NOT NULL, mode TEXT NOT NULL, started_at TEXT NOT NULL
+            );
             CREATE TABLE snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, runner_id INTEGER NOT NULL, ts TEXT NOT NULL,
                 mid REAL NOT NULL, bid REAL NOT NULL, ask REAL NOT NULL, position REAL NOT NULL,
@@ -455,6 +490,45 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recent_fills_joins_symbol_newest_first_and_respects_limit() {
+        let db = mem_db();
+        let sol_id = db
+            .insert_runner("tSOLUSD", "grid", "paper", "2026-07-07T00:00:00Z")
+            .unwrap();
+        let xaut_id = db
+            .insert_runner("tXAUT:USD", "grid", "live", "2026-07-07T00:00:00Z")
+            .unwrap();
+        let fills = [
+            (sol_id, "buy", 160.0, 0.5, Some(0.0), "2026-07-07T10:00:00Z"),
+            (xaut_id, "buy", 3300.0, 0.01, None, "2026-07-07T11:00:00Z"),
+            (sol_id, "sell", 163.2, 0.5, Some(1.6), "2026-07-07T12:00:00Z"),
+        ];
+        for (runner_id, direction, price, quantity, realized_pnl, filled_at) in fills {
+            db.insert_fill(&FillRow {
+                runner_id,
+                exchange_id: None,
+                direction: direction.to_string(),
+                price,
+                quantity,
+                realized_pnl,
+                filled_at: filled_at.to_string(),
+            })
+            .unwrap();
+        }
+
+        let recent = db.recent_fills(2).unwrap();
+        assert_eq!(recent.len(), 2, "limit must cap the result");
+        assert_eq!(recent[0].symbol, "tSOLUSD");
+        assert_eq!(recent[0].direction, "sell");
+        assert_eq!(recent[0].price, 163.2);
+        assert_eq!(recent[0].quantity, 0.5);
+        assert_eq!(recent[0].realized_pnl, Some(1.6));
+        assert_eq!(recent[0].filled_at, "2026-07-07T12:00:00Z");
+        assert_eq!(recent[1].symbol, "tXAUT:USD");
+        assert_eq!(recent[1].realized_pnl, None);
     }
 
     #[test]
