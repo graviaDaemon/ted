@@ -131,6 +131,9 @@ pub async fn resolve_snapshot_absences(
         if !fill_signals.is_empty() {
             dispatch::dispatch_signals(state, &fill_signals, engine).await;
         }
+        if changed {
+            replace_missing_exits(src, state, engine).await;
+        }
     }
 
     // Prune any tracked live ids no longer open and not pending (terminal, already
@@ -216,6 +219,37 @@ pub async fn sync_orders_after_reconnect(src: &str, symbol: &str, state: &mut Ru
     }
 
     state.save_state();
+    replace_missing_exits(src, state, engine).await;
+}
+
+/// Re-dispatch the strategy's expected lot exits (plan/09). The dispatcher
+/// skips exits still pending on the exchange, so only exits lost to an
+/// out-of-band cancel or a missed placement are actually re-placed — this
+/// keeps the "every lot's exit is always resting" invariant across
+/// disconnects and snapshot reconciles.
+async fn replace_missing_exits(src: &str, state: &mut RunnerState, engine: &EngineHandle) {
+    let exits = state.algorithm.expected_exits();
+    if exits.is_empty() {
+        return;
+    }
+    let missing: Vec<_> = exits
+        .into_iter()
+        .filter(|sig| match sig {
+            crate::api::TradeSignal::Sell { price, .. } => !state
+                .pending_sell_orders
+                .values()
+                .any(|(p, _)| (p - price).abs() < 1e-6),
+            _ => false,
+        })
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    crate::logger::log(
+        src,
+        &format!("Reconcile: {} lot exit(s) not resting — re-placing.", missing.len()),
+    );
+    dispatch::dispatch_signals(state, &missing, engine).await;
 }
 
 #[cfg(test)]

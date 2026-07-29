@@ -28,9 +28,12 @@ pub(crate) fn mode_label(mode: &RunnerMode) -> &'static str {
     }
 }
 
+/// Whether the grid's spacing is ATR-driven. An explicit `spacing` option no
+/// longer disables this (plan/09): it seeds the initial value and skips only
+/// the initial fetch, while the periodic refresh keeps spacing
+/// volatility-adaptive instead of pinning it for the runner's whole life.
 fn should_fetch_atr(algo_name: &str, options: &HashMap<String, String>) -> bool {
     algo_name == "grid"
-        && !options.contains_key("spacing")
         && (options.contains_key("atr_period")
             || options.contains_key("atr_timeframe")
             || options.contains_key("atr_multiplier"))
@@ -86,18 +89,21 @@ async fn wait_for_wallet_event(
             match event_rx.recv().await {
                 Some(EngineEvent::WalletSnapshot { balances }) => {
                     let (base, quote) = extract_currencies(symbol);
-                    let mut map: HashMap<String, f64> = HashMap::new();
-                    for (wallet_type, currency, available) in balances {
+                    let mut map: HashMap<String, (f64, f64)> = HashMap::new();
+                    for (wallet_type, currency, total, available) in balances {
                         if wallet_type == "exchange" {
-                            map.insert(currency, available);
+                            map.insert(currency, (total, available));
                         }
                     }
-                    let base_bal = map.get(&base).copied().unwrap_or(0.0);
-                    let quote_bal = map.get(&quote).copied().unwrap_or(0.0);
+                    // Total for base (all held inventory seeds the grid, even
+                    // if order-locked); available for quote (what can actually
+                    // fund the buy ladder).
+                    let base_bal = map.get(&base).map(|&(t, _)| t).unwrap_or(0.0);
+                    let quote_bal = map.get(&quote).map(|&(_, a)| a).unwrap_or(0.0);
                     crate::logger::log(
                         &format!("RUNNER:{}", symbol),
                         &format!(
-                            "Wallet: {} {:.8}, {} {:.8}",
+                            "Wallet: {} {:.8} (total), {} {:.8} (available)",
                             base, base_bal, quote, quote_bal
                         ),
                     );
@@ -202,9 +208,11 @@ pub async fn run_runner(
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(256);
     engine.subscribe(symbol.clone(), event_tx).await;
 
-    // Evaluated before the initial ATR fetch injects `spacing` into the options
-    // (which would make `should_fetch_atr` read false afterwards).
     let needs_atr = should_fetch_atr(&algo_name, &options);
+    // An explicit spacing seeds the initial value: skip the initial ATR fetch
+    // but keep the periodic refresh (plan/09 — the live session's spacing was
+    // otherwise pinned for 22 days across changing volatility).
+    let spacing_seeded = options.contains_key("spacing");
     let needs_trend = should_refresh_trend(&algo_name, &options);
 
     if mode != RunnerMode::Simulation {
@@ -220,7 +228,7 @@ pub async fn run_runner(
             }
         }
 
-        if needs_atr {
+        if needs_atr && !spacing_seeded {
             let timeframe = options
                 .get("atr_timeframe")
                 .cloned()
@@ -273,6 +281,16 @@ pub async fn run_runner(
             // clear one-line error instead of letting it run and spew
             // `symbol: invalid` / HTTP 500 on every reconnect (cf. the `XAUD:USD`
             // typo that ran for days).
+            if needs_atr {
+                crate::logger::log_info(
+                    &src,
+                    &format!(
+                        "Spacing {} seeded from options → ATR refresh active (every {} min).",
+                        options.get("spacing").map(String::as_str).unwrap_or("?"),
+                        config.startup_defaults.atr_refresh_mins
+                    ),
+                );
+            }
             match engine.fetch_candles(symbol.clone(), "1m".to_string(), 1).await {
                 Ok(candles) if !candles.is_empty() => {}
                 Ok(_) => {
@@ -305,21 +323,56 @@ pub async fn run_runner(
             .or_insert_with(|| "1000000.0".to_string());
     }
 
-    let maker_fee = options
-        .get("maker_fee")
-        .and_then(|v| v.parse::<f64>().ok())
+    // Fee precedence (plan/10): explicit option > live-fetched account fees >
+    // config default. The Jul 7–29 session traded live with the 0.0 scaffold
+    // default, so the fee floor and the accounting were fee-blind.
+    let explicit_maker = options.get("maker_fee").and_then(|v| v.parse::<f64>().ok());
+    let explicit_taker = options.get("taker_fee").and_then(|v| v.parse::<f64>().ok());
+    let fetched_fees = if (explicit_maker.is_none() || explicit_taker.is_none())
+        && mode != RunnerMode::Simulation
+    {
+        match engine.fetch_account_fees().await {
+            Ok(fees) => Some(fees),
+            Err(e) => {
+                crate::logger::log_warn(
+                    &src,
+                    &format!("Account fee fetch failed ({}) — falling back to config defaults.", e),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let maker_fee = explicit_maker
+        .or(fetched_fees.map(|f| f.0))
         .unwrap_or(config.startup_defaults.default_maker_fee);
-    let taker_fee = options
-        .get("taker_fee")
-        .and_then(|v| v.parse::<f64>().ok())
+    let taker_fee = explicit_taker
+        .or(fetched_fees.map(|f| f.1))
         .unwrap_or(config.startup_defaults.default_taker_fee);
+    let fee_source = if explicit_maker.is_some() && explicit_taker.is_some() {
+        "option"
+    } else if fetched_fees.is_some() {
+        "account"
+    } else {
+        "config default"
+    };
+    if fee_source == "config default" && mode == RunnerMode::Live && maker_fee == 0.0 {
+        crate::logger::log_warn(
+            &src,
+            "Live runner is fee-blind: account fee fetch unavailable and config default_maker_fee is 0.0 — PnL floors assume free trading.",
+        );
+    }
     options.insert("maker_fee".to_string(), format!("{}", maker_fee));
     options.insert("taker_fee".to_string(), format!("{}", taker_fee));
 
-    let max_drawdown_pct = options
-        .get("max_drawdown_pct")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0);
+    // On by default since plan/09: the halt only stops new buys (lot exits keep
+    // resting), so it is a disaster brake, not a routine trip hazard. Pass
+    // `max_drawdown_pct=0` to disable explicitly.
+    let max_drawdown_pct = match options.get("max_drawdown_pct") {
+        Some(v) => v.parse::<f64>().ok().filter(|x| *x > 0.0),
+        None => Some(0.20),
+    };
 
     // Sanity-check the capital budget against the quote actually free in the wallet
     // (plan/06 step 1). The wallet is shared across runners, so this is a warning,
@@ -479,8 +532,8 @@ pub async fn run_runner(
     crate::logger::log_info(
         &src,
         &format!(
-            "Fees: maker {:.6}, taker {:.6}",
-            state.maker_fee, state.taker_fee
+            "Fees: maker {:.6}, taker {:.6} ({})",
+            state.maker_fee, state.taker_fee, fee_source
         ),
     );
     match state.max_drawdown_pct {
@@ -549,8 +602,8 @@ pub async fn run_runner(
                         process_wallet_snapshot(&mut state, balances);
                     }
 
-                    Some(EngineEvent::WalletUpdate { wallet_type, currency, available }) => {
-                        process_wallet_update(&mut state, wallet_type, currency, available);
+                    Some(EngineEvent::WalletUpdate { wallet_type, currency, total, available }) => {
+                        process_wallet_update(&mut state, wallet_type, currency, total, available);
                     }
 
                     Some(EngineEvent::PublicWsReconnected) => {
@@ -731,10 +784,36 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
     state.trade_log.push(entry);
 }
 
+/// Cancel resting buy orders only, leaving sells (lot exits) on the exchange —
+/// the drawdown-halt semantics since plan/09: exits only reduce risk, so they
+/// keep resting through a halt.
+async fn cancel_live_buy_orders(state: &mut RunnerState, engine: &EngineHandle) {
+    if state.mode == RunnerMode::Simulation || state.pending_buy_orders.is_empty() {
+        return;
+    }
+    let src = format!("RUNNER:{}", state.symbol);
+    let ids: Vec<i64> = state.pending_buy_orders.keys().copied().collect();
+    crate::logger::log(&src, &format!("Cancelling {} open buy order(s)…", ids.len()));
+    for order_id in ids {
+        match engine.cancel_order(order_id).await {
+            Ok(()) => {
+                state.live_order_ids.remove(&order_id);
+                state.pending_buy_orders.remove(&order_id);
+                crate::logger::log(&src, &format!("Cancelled buy order {}.", order_id));
+            }
+            Err(e) => crate::logger::log(
+                &src,
+                &format!("Failed to cancel buy order {}: {}", order_id, e),
+            ),
+        }
+    }
+}
+
 /// Algorithm-independent drawdown guard. Computes current equity
 /// (quote balance + position marked at mid) each tick, tracks the peak, and if
 /// the relative drawdown exceeds `max_drawdown_pct` halts the runner: cancels
-/// all live orders and stops dispatching new signals until a manual resume.
+/// resting buys (lot exits keep resting — they only reduce risk) and stops
+/// dispatching new signals until a manual resume.
 /// Returns `true` while the runner is halted.
 async fn check_risk(state: &mut RunnerState, engine: &EngineHandle) -> bool {
     if state.halted {
@@ -749,10 +828,9 @@ async fn check_risk(state: &mut RunnerState, engine: &EngineHandle) -> bool {
         return false;
     };
 
-    let (_, quote) = extract_currencies(&state.symbol);
-    let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
-    let position = state.algorithm.position();
-    let equity = quote_bal + position * mid;
+    // Wallet-truth equity (plan/10): total balances including order-locked
+    // funds, so the halt tracks the number the user could actually withdraw.
+    let equity = state.wallet_equity(mid);
 
     if equity > state.peak_equity {
         state.peak_equity = equity;
@@ -766,14 +844,14 @@ async fn check_risk(state: &mut RunnerState, engine: &EngineHandle) -> bool {
             crate::logger::log_critical(
                 &src,
                 &format!(
-                    "MAX DRAWDOWN BREACHED: equity {:.2} is {:.2}% below peak {:.2} (limit {:.2}%). Halting runner — cancelling all live orders. Send resume to continue.",
+                    "MAX DRAWDOWN BREACHED: equity {:.2} is {:.2}% below peak {:.2} (limit {:.2}%). Halting new buys — cancelling resting buys, lot exits stay on the exchange. Send resume to continue.",
                     equity,
                     drawdown * 100.0,
                     state.peak_equity,
                     max_dd * 100.0
                 ),
             );
-            cancel_all_live_orders(state, engine).await;
+            cancel_live_buy_orders(state, engine).await;
             return true;
         }
     }
@@ -835,15 +913,15 @@ fn process_cancelled(state: &mut RunnerState, order_id: i64) {
     }
 }
 
-fn process_wallet_snapshot(state: &mut RunnerState, balances: Vec<(String, String, f64)>) {
+fn process_wallet_snapshot(state: &mut RunnerState, balances: Vec<(String, String, f64, f64)>) {
     let src = format!("RUNNER:{}", state.symbol);
     let (base, quote) = extract_currencies(&state.symbol);
     state.wallet_balances.clear();
-    for (wallet_type, currency, available) in balances {
+    for (wallet_type, currency, total, available) in balances {
         if wallet_type == "exchange"
             && (base.is_empty() || quote.is_empty() || currency == base || currency == quote)
         {
-            state.wallet_balances.insert(currency, available);
+            state.wallet_balances.insert(currency, (total, available));
         }
     }
     crate::logger::log(
@@ -853,8 +931,8 @@ fn process_wallet_snapshot(state: &mut RunnerState, balances: Vec<(String, Strin
             state.wallet_balances.len()
         ),
     );
-    let base_bal = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
-    let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
+    let base_bal = state.wallet_balances.get(&base).map(|&(_, a)| a).unwrap_or(0.0);
+    let quote_bal = state.wallet_balances.get(&quote).map(|&(_, a)| a).unwrap_or(0.0);
     state.algorithm.on_balance_update(base_bal, quote_bal);
 }
 
@@ -862,19 +940,25 @@ fn process_wallet_update(
     state: &mut RunnerState,
     wallet_type: String,
     currency: String,
+    total: f64,
     available: f64,
 ) {
     if wallet_type == "exchange" {
         let src = format!("RUNNER:{}", state.symbol);
         let (base, quote) = extract_currencies(&state.symbol);
         if base.is_empty() || quote.is_empty() || currency == base || currency == quote {
-            state.wallet_balances.insert(currency.clone(), available);
+            state
+                .wallet_balances
+                .insert(currency.clone(), (total, available));
             crate::logger::log(
                 &src,
-                &format!("Wallet update: {} available = {:.8}", currency, available),
+                &format!(
+                    "Wallet update: {} total = {:.8}, available = {:.8}",
+                    currency, total, available
+                ),
             );
-            let base_bal = state.wallet_balances.get(&base).copied().unwrap_or(0.0);
-            let quote_bal = state.wallet_balances.get(&quote).copied().unwrap_or(0.0);
+            let base_bal = state.wallet_balances.get(&base).map(|&(_, a)| a).unwrap_or(0.0);
+            let quote_bal = state.wallet_balances.get(&quote).map(|&(_, a)| a).unwrap_or(0.0);
             state.algorithm.on_balance_update(base_bal, quote_bal);
         }
     }

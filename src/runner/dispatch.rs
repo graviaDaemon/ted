@@ -66,7 +66,7 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
                 } else {
                     let (_, quote) = extract_currencies(&state.symbol);
                     if !state.wallet_balances.is_empty() && !quote.is_empty()
-                        && let Some(&bal) = state.wallet_balances.get(&quote)
+                        && let Some(&(_, bal)) = state.wallet_balances.get(&quote)
                         && bal < price * quantity
                     {
                         crate::logger::log(&src, &format!("[{}] Insufficient {} ({:.4} < {:.4}) — skipping BUY.", mode_label(&state.mode), quote, bal, price * quantity));
@@ -107,7 +107,7 @@ pub async fn dispatch_signals(state: &mut RunnerState, signals: &[TradeSignal], 
                 } else {
                     let (base, _) = extract_currencies(&state.symbol);
                     if !state.wallet_balances.is_empty() && !base.is_empty()
-                        && let Some(&bal) = state.wallet_balances.get(&base)
+                        && let Some(&(_, bal)) = state.wallet_balances.get(&base)
                         && bal < *quantity
                     {
                         crate::logger::log(&src, &format!("[{}] Insufficient {} ({:.8} < {:.8}) — skipping SELL.", mode_label(&state.mode), base, bal, quantity));

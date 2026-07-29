@@ -246,7 +246,7 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
         }
 
         "ws" => {
-            let balances: Vec<(String, String, f64)> = arr
+            let balances: Vec<(String, String, f64, f64)> = arr
                 .get(2)
                 .and_then(|v| v.as_array())
                 .map(|entries| {
@@ -255,11 +255,13 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
                         .filter_map(|e| {
                             let wallet_type = e.get(0)?.as_str()?.to_string();
                             let currency    = e.get(1)?.as_str()?.to_string();
+                            let total       = e.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            // AVAILABLE_BALANCE is null until Bitfinex has
+                            // calculated it — fall back to the total.
                             let available   = e.get(4)
                                 .and_then(|v| v.as_f64())
-                                .or_else(|| e.get(2).and_then(|v| v.as_f64()))
-                                .unwrap_or(0.0);
-                            Some((wallet_type, currency, available))
+                                .unwrap_or(total);
+                            Some((wallet_type, currency, total, available))
                         })
                         .collect()
                 })
@@ -279,12 +281,15 @@ pub fn parse_auth_ws_message(msg: &str) -> WsEvent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let total = entry
+                .and_then(|e| e.get(2))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let available = entry
                 .and_then(|e| e.get(4))
                 .and_then(|v| v.as_f64())
-                .or_else(|| entry.and_then(|e| e.get(2)).and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            WsEvent::WalletUpdate { wallet_type, currency, available }
+                .unwrap_or(total);
+            WsEvent::WalletUpdate { wallet_type, currency, total, available }
         }
 
         _ => WsEvent::Unknown,

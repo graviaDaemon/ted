@@ -31,6 +31,8 @@ pub trait Exchange: Send + Sync {
     async fn cancel_order(&self, order_id: i64) -> Result<(), String>;
     async fn fetch_open_orders(&self, symbol: &str) -> Result<Vec<i64>, String>;
     async fn fetch_order_history(&self, symbol: &str) -> Result<Vec<(i64, String)>, String>;
+    /// The account's exchange-trading (maker, taker) fee rates as fractions.
+    async fn fetch_account_fees(&self) -> Result<(f64, f64), String>;
     async fn fetch_candles(&self, symbol: &str, timeframe: &str, period: usize)
         -> Result<Vec<Candle>, String>;
     async fn fetch_candle_history(&self, symbol: &str, timeframe: &str, limit: usize)

@@ -19,6 +19,15 @@ fn default_snapshot_retention_days() -> u32 {
 fn default_snapshot_interval_secs() -> u64 {
     60
 }
+// Non-zero fallbacks (plan/10): live fees come from the account summary fetch;
+// these engage only when the fetch fails, and 0.0 there means fee-blind
+// trading — the standard Bitfinex tier is the safer assumption.
+fn default_maker_fee() -> f64 {
+    0.001
+}
+fn default_taker_fee() -> f64 {
+    0.002
+}
 
 /// Process-wide credential selection. The engine is spawned once with a single
 /// `Config`, so credential routing is process-wide (not per-runner) for this
@@ -63,9 +72,9 @@ pub struct StartupDefaults {
     pub snapshot_retention_days: u32,
     #[serde(default = "default_snapshot_interval_secs")]
     pub snapshot_interval_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_maker_fee")]
     pub default_maker_fee: f64,
-    #[serde(default)]
+    #[serde(default = "default_taker_fee")]
     pub default_taker_fee: f64,
     #[serde(default)]
     pub paper: bool,
@@ -131,7 +140,7 @@ impl Config {
                  Expected nested format:\n\
                  {{\n\
                  \x20 \"api\": {{ \"auth_endpoint\": \"...\", \"pub_endpoint\": \"...\", \"ws_endpoint\": \"...\", \"auth_ws_endpoint\": \"...\", \"key\": \"...\", \"secret\": \"...\", \"paper_key\": \"...\", \"paper_secret\": \"...\" }},\n\
-                 \x20 \"startup_defaults\": {{ \"throttle_ms\": 300, \"log_retention\": 7, \"atr_refresh_mins\": 60, \"log_level\": \"info\", \"snapshot_retention_days\": 30, \"snapshot_interval_secs\": 60, \"default_maker_fee\": 0.0, \"default_taker_fee\": 0.0, \"paper\": false }}\n\
+                 \x20 \"startup_defaults\": {{ \"throttle_ms\": 300, \"log_retention\": 7, \"atr_refresh_mins\": 60, \"log_level\": \"info\", \"snapshot_retention_days\": 30, \"snapshot_interval_secs\": 60, \"default_maker_fee\": 0.001, \"default_taker_fee\": 0.002, \"paper\": false }}\n\
                  }}\n\
                  \n\
                  See config.template.json for the full template.",
@@ -218,7 +227,9 @@ mod tests {
         assert_eq!(cfg.startup_defaults.log_level, "info");
         assert_eq!(cfg.startup_defaults.snapshot_retention_days, 30);
         assert_eq!(cfg.startup_defaults.snapshot_interval_secs, 60);
-        assert_eq!(cfg.startup_defaults.default_maker_fee, 0.0);
+        // Fee defaults are non-zero since plan/10 — fee-blind is opt-in only.
+        assert_eq!(cfg.startup_defaults.default_maker_fee, 0.001);
+        assert_eq!(cfg.startup_defaults.default_taker_fee, 0.002);
         assert!(!cfg.startup_defaults.paper);
         assert_eq!(cfg.credential_mode, CredentialMode::Live);
         cfg.validate().expect("legacy config should validate");

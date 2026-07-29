@@ -279,6 +279,15 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
     // computed the same way the live runner computes it.
     let mut options = cfg.options.clone();
     maybe_inject_atr_spacing(&cfg.algorithm, &mut options, &candles)?;
+    // The replayed algorithm books fees itself (lot accounting since plan/09),
+    // so it must see the same fee the Sim charges — mirror the live runner,
+    // which injects the resolved fees into the options before building.
+    options
+        .entry("maker_fee".to_string())
+        .or_insert_with(|| format!("{}", cfg.maker_fee));
+    options
+        .entry("taker_fee".to_string())
+        .or_insert_with(|| format!("{}", cfg.taker_fee));
 
     let mut algo = build_algorithm(&cfg.algorithm, &options)?;
 
@@ -342,6 +351,8 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
                 break;
             }
 
+            let algo_realized_before = algo.realized_pnl();
+            let algo_trades_before = algo.trade_count();
             if fill.is_buy {
                 sim.fill_buy(fill.price, fill.qty, candle.timestamp);
             } else {
@@ -363,6 +374,16 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
                     frozen.insert(price_key(price));
                 }
             }
+
+            // The report speaks the strategy's own accounting (per-lot since
+            // plan/09): when the algorithm booked this sell, its realized delta
+            // replaces the Sim's avg-cost figure on the trade row.
+            if !fill.is_buy
+                && algo.trade_count() > algo_trades_before
+                && let Some(last) = sim.trades.last_mut()
+            {
+                last.realized = algo.realized_pnl() - algo_realized_before;
+            }
         }
 
         equity_curve.push(sim.quote_balance + sim.base_balance * mid);
@@ -382,6 +403,15 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
         0.0
     };
 
+    // Prefer the algorithm's own accounting (lot-truth for the grid) whenever
+    // it booked fills; fall back to the Sim's avg-cost book for strategies
+    // without internal accounting (e.g. Rhai scripts).
+    let (realized_pnl_net, fees_paid) = if algo.trade_count() > 0 {
+        (algo.realized_pnl(), algo.fees_paid())
+    } else {
+        (sim.book.realized_pnl, sim.book.fees_paid)
+    };
+
     Ok(BacktestReport {
         symbol: cfg.symbol.clone(),
         algorithm: cfg.algorithm.clone(),
@@ -394,8 +424,8 @@ pub fn run_backtest(cfg: &BacktestConfig, candles_in: &[Candle]) -> Result<Backt
         taker_fee: cfg.taker_fee,
         start_quote_balance: cfg.start_quote_balance,
         start_base_balance: cfg.start_base_balance,
-        realized_pnl_net: sim.book.realized_pnl,
-        fees_paid: sim.book.fees_paid,
+        realized_pnl_net,
+        fees_paid,
         max_drawdown,
         win_rate,
         starting_equity,
@@ -663,6 +693,19 @@ fn parse_jsonl(text: &str) -> Result<Vec<Candle>, String> {
         return rows.iter().map(candle_from_value).collect();
     }
 
+    // A T.E.D per-symbol trade store (tick-level `TradeEntry` rows with
+    // bid/ask and an RFC3339 timestamp) is accepted directly and aggregated
+    // into candles, so a live session's `trades_*.jsonl` can be replayed
+    // without an external conversion step.
+    let first_data_line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    let is_tick_file = first_data_line
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| v.get("bid").is_some() && v.get("ask").is_some())
+        .unwrap_or(false);
+    if is_tick_file {
+        return candles_from_tick_jsonl(text);
+    }
+
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -673,6 +716,71 @@ fn parse_jsonl(text: &str) -> Result<Vec<Candle>, String> {
             serde_json::from_str(line).map_err(|e| format!("Bad JSON on line {}: {}", i + 1, e))?;
         out.push(candle_from_value(&val)?);
     }
+    Ok(out)
+}
+
+/// Candle bucket width used when aggregating tick-level trade-store rows.
+const TICK_CANDLE_MS: i64 = 30 * 60 * 1000;
+
+fn candles_from_tick_jsonl(text: &str) -> Result<Vec<Candle>, String> {
+    let mut ticks: Vec<(i64, f64)> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("Bad JSON on line {}: {}", i + 1, e))?;
+        let ts = val
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp_millis())
+            .ok_or_else(|| format!("Bad or missing RFC3339 timestamp on line {}", i + 1))?;
+        let bid = val.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ask = val.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if bid <= 0.0 || ask <= 0.0 {
+            continue;
+        }
+        ticks.push((ts, (bid + ask) / 2.0));
+    }
+    if ticks.is_empty() {
+        return Err("No usable ticks in trade-store file".to_string());
+    }
+    ticks.sort_by_key(|&(ts, _)| ts);
+
+    let mut out: Vec<Candle> = Vec::new();
+    for &(ts, mid) in &ticks {
+        let bucket = ts - ts.rem_euclid(TICK_CANDLE_MS);
+        match out.last_mut() {
+            Some(c) if c.timestamp == bucket => {
+                c.close = mid;
+                if mid > c.high {
+                    c.high = mid;
+                }
+                if mid < c.low {
+                    c.low = mid;
+                }
+            }
+            _ => out.push(Candle {
+                timestamp: bucket,
+                open: mid,
+                close: mid,
+                high: mid,
+                low: mid,
+                volume: 0.0,
+            }),
+        }
+    }
+    crate::logger::log(
+        "[BACKTEST]",
+        &format!(
+            "Aggregated {} ticks into {} candles of {} min.",
+            ticks.len(),
+            out.len(),
+            TICK_CANDLE_MS / 60_000
+        ),
+    );
     Ok(out)
 }
 
@@ -894,6 +1002,52 @@ mod tests {
             "expected round-trip PnL 10, got {}",
             report.realized_pnl_net
         );
+    }
+
+    #[test]
+    fn falling_market_never_realizes_a_loss() {
+        // The plan/09 invariant: in a drop-then-bounce, every closed round trip
+        // exits at or above its own lot's breakeven — no sell fill may ever
+        // book negative realized PnL.
+        let candles = vec![
+            candle(1, 100.0, 100.0, 100.0, 100.0),
+            candle(2, 100.0, 90.0, 100.0, 90.0),
+            candle(3, 90.0, 85.0, 90.0, 85.0),
+            candle(4, 85.0, 101.0, 101.0, 85.0),
+        ];
+        let options = opt(&[("levels", "3"), ("qty", "1"), ("spacing", "5"), ("trend_filter", "off")]);
+        let mut c = cfg(options, 0.0);
+        c.start_base_balance = 0.0;
+        let report = run_backtest(&c, &candles).unwrap();
+        let sells: Vec<_> = report.trades.iter().filter(|t| !t.is_buy).collect();
+        assert!(!sells.is_empty(), "the bounce must close round trips");
+        for t in &sells {
+            assert!(
+                t.realized >= -1e-9,
+                "sell @ {} booked negative realized {}",
+                t.price,
+                t.realized
+            );
+        }
+        assert!(report.realized_pnl_net >= 0.0, "net realized {}", report.realized_pnl_net);
+    }
+
+    #[test]
+    fn tick_jsonl_aggregates_into_candles() {
+        // Two ticks in one 30m bucket, one in the next — trade-store rows are
+        // detected by their bid/ask fields and aggregated.
+        let jsonl = concat!(
+            "{\"timestamp\":\"2026-07-07T15:00:00Z\",\"symbol\":\"SOLUSD\",\"last_price\":82.0,\"bid\":81.9,\"ask\":82.1,\"volume\":1.0,\"signals\":[],\"dry_run\":false}\n",
+            "{\"timestamp\":\"2026-07-07T15:10:00Z\",\"symbol\":\"SOLUSD\",\"last_price\":83.0,\"bid\":82.9,\"ask\":83.1,\"volume\":1.0,\"signals\":[],\"dry_run\":false}\n",
+            "{\"timestamp\":\"2026-07-07T15:40:00Z\",\"symbol\":\"SOLUSD\",\"last_price\":81.0,\"bid\":80.9,\"ask\":81.1,\"volume\":1.0,\"signals\":[],\"dry_run\":false}\n",
+        );
+        let candles = parse_jsonl(jsonl).unwrap();
+        assert_eq!(candles.len(), 2);
+        assert!((candles[0].open - 82.0).abs() < 1e-9);
+        assert!((candles[0].close - 83.0).abs() < 1e-9);
+        assert!((candles[0].high - 83.0).abs() < 1e-9);
+        assert!((candles[0].low - 82.0).abs() < 1e-9);
+        assert!((candles[1].open - 81.0).abs() < 1e-9);
     }
 
     #[test]

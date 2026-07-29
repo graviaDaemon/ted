@@ -33,6 +33,9 @@ pub enum EngineRequest {
         period: usize,
         reply: oneshot::Sender<Result<Vec<Candle>, String>>,
     },
+    FetchAccountFees {
+        reply: oneshot::Sender<Result<(f64, f64), String>>,
+    },
 }
 
 #[derive(Clone)]
@@ -49,11 +52,14 @@ pub enum EngineEvent {
         order_ids: Vec<i64>,
     },
     WalletSnapshot {
-        balances: Vec<(String, String, f64)>,
+        /// (wallet_type, currency, total, available) — total includes
+        /// order-locked funds (equity truth); available funds new orders.
+        balances: Vec<(String, String, f64, f64)>,
     },
     WalletUpdate {
         wallet_type: String,
         currency: String,
+        total: f64,
         available: f64,
     },
     AuthConnected,

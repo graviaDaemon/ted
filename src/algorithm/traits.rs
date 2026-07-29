@@ -43,6 +43,22 @@ pub trait Algorithm: Send {
     fn trade_count(&self) -> u64 {
         0
     }
+    /// Number of open lots the strategy tracks (plan/10 TUI readout).
+    fn open_lots(&self) -> usize {
+        0
+    }
+    /// Current trend regime label (e.g. "up"/"flat"/"down") when the strategy
+    /// tracks one (plan/10 TUI readout).
+    fn trend_state(&self) -> Option<&'static str> {
+        None
+    }
+    /// Sell signals for every exit the strategy expects to be resting on the
+    /// exchange (plan/09). The runner re-dispatches these after reconciling so
+    /// a lot exit lost to an out-of-band cancel is re-placed; the dispatcher
+    /// skips any still pending, so re-dispatching is idempotent.
+    fn expected_exits(&self) -> Vec<TradeSignal> {
+        vec![]
+    }
     /// Serialize the strategy's internal dynamic state to JSON for resume.
     /// Returns `None` when the strategy cannot meaningfully persist state
     /// (e.g. Rhai scripts, whose state lives in the engine scope).

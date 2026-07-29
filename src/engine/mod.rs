@@ -56,6 +56,12 @@ impl EngineHandle {
         let _ = self.request_tx.send(EngineRequest::FetchCandles { symbol, timeframe, period, reply: tx }).await;
         rx.await.map_err(|_| "engine dropped reply".to_string())?
     }
+
+    pub async fn fetch_account_fees(&self) -> Result<(f64, f64), String> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_tx.send(EngineRequest::FetchAccountFees { reply: tx }).await;
+        rx.await.map_err(|_| "engine dropped reply".to_string())?
+    }
 }
 
 pub fn spawn_engine(exchange: Arc<dyn Exchange>) -> (EngineHandle, tokio::task::JoinHandle<()>) {
@@ -73,6 +79,7 @@ enum RestJob {
     FetchOrders  { symbol: String,                      reply: oneshot::Sender<Result<Vec<i64>, String>> },
     FetchHistory { symbol: String,                      reply: oneshot::Sender<Result<Vec<(i64, String)>, String>> },
     FetchCandles { symbol: String, timeframe: String, period: usize, reply: oneshot::Sender<Result<Vec<Candle>, String>> },
+    FetchFees    { reply: oneshot::Sender<Result<(f64, f64), String>> },
 }
 
 async fn rest_worker(exchange: Arc<dyn Exchange>, mut rest_rx: mpsc::Receiver<RestJob>) {
@@ -93,6 +100,9 @@ async fn rest_worker(exchange: Arc<dyn Exchange>, mut rest_rx: mpsc::Receiver<Re
             RestJob::FetchCandles { symbol, timeframe, period, reply } => {
                 let _ = reply.send(exchange.fetch_candles(&symbol, &timeframe, period).await);
             }
+            RestJob::FetchFees { reply } => {
+                let _ = reply.send(exchange.fetch_account_fees().await);
+            }
         }
     }
 }
@@ -106,7 +116,7 @@ struct Engine {
     subscribers: HashMap<String, mpsc::Sender<EngineEvent>>,
     auth_ws: Option<WsStream>,
     auth_subscribers: Vec<mpsc::Sender<EngineEvent>>,
-    last_wallet_snapshot: Option<Vec<(String, String, f64)>>,
+    last_wallet_snapshot: Option<Vec<(String, String, f64, f64)>>,
 }
 
 impl Engine {
@@ -223,6 +233,9 @@ impl Engine {
             EngineRequest::FetchCandles { symbol, timeframe, period, reply } => {
                 let _ = self.rest_tx.send(RestJob::FetchCandles { symbol, timeframe, period, reply }).await;
             }
+            EngineRequest::FetchAccountFees { reply } => {
+                let _ = self.rest_tx.send(RestJob::FetchFees { reply }).await;
+            }
         }
     }
 
@@ -258,15 +271,16 @@ impl Engine {
                 self.last_wallet_snapshot = Some(balances.clone());
                 EngineEvent::WalletSnapshot { balances }
             }
-            WsEvent::WalletUpdate { wallet_type, currency, available }   => {
+            WsEvent::WalletUpdate { wallet_type, currency, total, available } => {
                 if let Some(snapshot) = &mut self.last_wallet_snapshot {
-                    if let Some(entry) = snapshot.iter_mut().find(|(wt, cur, _)| wt == &wallet_type && cur == &currency) {
-                        entry.2 = available;
+                    if let Some(entry) = snapshot.iter_mut().find(|(wt, cur, _, _)| wt == &wallet_type && cur == &currency) {
+                        entry.2 = total;
+                        entry.3 = available;
                     } else {
-                        snapshot.push((wallet_type.clone(), currency.clone(), available));
+                        snapshot.push((wallet_type.clone(), currency.clone(), total, available));
                     }
                 }
-                EngineEvent::WalletUpdate { wallet_type, currency, available }
+                EngineEvent::WalletUpdate { wallet_type, currency, total, available }
             }
             _ => return,
         };

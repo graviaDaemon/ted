@@ -245,6 +245,29 @@ impl Db {
         Ok(())
     }
 
+    /// Oldest daily-rollup equity within the trailing `days` window for a
+    /// symbol, joined across that symbol's runner sessions — the baseline for
+    /// the TUI's trailing PnL% readout (plan/10).
+    pub fn equity_baseline(
+        &self,
+        symbol: &str,
+        days: u32,
+    ) -> Result<Option<(String, f64)>, rusqlite::Error> {
+        let cutoff = (Utc::now() - Duration::days(days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        self.conn
+            .query_row(
+                "SELECT d.day, d.ending_equity FROM daily_rollups d \
+                 JOIN runners r ON r.id = d.runner_id \
+                 WHERE r.symbol = ?1 AND d.day >= ?2 \
+                 ORDER BY d.day ASC, d.id ASC LIMIT 1",
+                params![symbol, cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
     pub fn save_runner_state(&self, row: &RunnerStateRow) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO runner_state (symbol, algorithm, mode, options, algo_state, pending_buys, pending_sells, updated_at) \

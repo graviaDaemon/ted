@@ -256,3 +256,78 @@ the remaining defect is in the grid's own maintenance loop. Full evidence in the
   strategy concept: +$8.25 realized in the ~3 days the grid was actually two-sided and trading
   annualizes to a healthy rate on this account size. The loss was the ~11 of 14 days spent
   one-sided or deadlocked. Fixing flow-through, not raising per-trade capture, is the lever.
+## 2026-07-29 — Round 4: per-lot grid, downtrend scalping, fee & equity truth, second pair (see plan/09–11)
+
+- **Decision:** Replace the 5%/week goal with a **realistic grid target**: capital preservation in
+  downtrends, 0.5–2%/week in ranging markets, measured against buy-and-hold.
+  **Why:** 5%/week compounds to ~12×/year; no long-only spot grid delivers that sustainably.
+  User accepted the recommendation explicitly (2026-07-29).
+
+- **Decision:** Move the grid from avg-cost ladder accounting to **per-lot tracking**: every buy
+  fill creates a lot with its own resting counter-sell (exit), priced at
+  `max(fill + spacing, breakeven incl fees + min_profit_frac)`, and **lot exits are never
+  cancelled or repriced below cost by grid maintenance**.
+  **Why:** The Jul 7–29 live history (requests/history/) shows −$35 realized (pre-fee) over 22
+  days in a −10% SOL market despite 1,335 fills. Three mechanisms flushed inventory below cost:
+  (1) re-centering cancels the entire sell ladder ("Rebuild: cancel stale sell") and later re-sells
+  lower; (2) on a buy fill with a full sell ladder, the *outermost/highest* sell — the exit of the
+  most expensive lot — is cancelled and replaced lower (`on_fill` "replace outermost sell");
+  (3) counter-sells are priced at `current_price + spacing`, not fill price, so in a fast drop the
+  exit lands below the entry. Per-lot exits with a breakeven floor eliminate all three; realized
+  PnL becomes ≥ min profit per round trip by construction, and downtrend damage becomes bounded
+  unrealized drawdown that recovers on bounces instead of being locked in.
+
+- **Decision:** In a confirmed downtrend the grid **keeps scalping fluctuations** (no hibernate,
+  no flatten): buys still rest below mid, each with its own profitable exit — but with reduced
+  size (`downtrend_qty_frac`, default 0.5), a single buy level (`downtrend_levels`, default 1),
+  extension buys still blocked, and a **notional inventory cap** (`max_inventory_frac` of capital,
+  default 0.75 normal / 0.5 downtrend) that stops new buys when total lot notional exceeds it.
+  **Why:** User's explicit choice (2026-07-29): "every fluctuation should still be able to make
+  profit … down/up fluctuations in a downward trend could still make minute profits." Hibernate
+  would miss those; flatten realizes losses at the worst moment. Caps bound the knife-catching.
+
+- **Decision:** **Risk halt on by default**: `max_drawdown_pct` defaults to `0.20` (halt new buys
+  + notify at 20% below peak equity; lot exits keep resting since they only reduce risk).
+  `stop_loss_pct` stays opt-in.
+  **Why:** User delegated the choice. With exits never below cost, drawdown is unrealized-only and
+  inventory-capped, so a 20% equity halt needs roughly a 30–40% asset drop at full inventory —
+  it is a disaster brake, not a routine trip hazard. A flatten-style stop contradicts the
+  never-sell-below-cost invariant, so it remains an explicit user opt-in. The Jul 7 live session
+  ran with the halt disabled because scout's risk options were never passed on spawn — defaults,
+  not documentation, are what actually ship.
+
+- **Decision:** **Fee truth everywhere**: fetch the account's real maker/taker fees from the
+  Bitfinex auth REST summary endpoint at spawn (precedence: explicit option > fetched > config
+  default), raise config-scaffold and sweep/backtest CLI fee defaults from 0.0 to 0.001/0.002,
+  and add a `min_profit_frac` floor so spacing must clear `2×maker_fee + min_profit_frac`.
+  **Why:** The live session ran with `Fees: maker 0.000000, taker 0.000000` (config default), so
+  the fee floor guard never engaged and the sweep optimized a zero-fee fantasy, picking spacing
+  (0.1227 ≈ 0.16%) below the standard-fee floor. Wallet-delta reconciliation of actual fills shows
+  Bitfinex currently charges this account ~zero fees — so fees were not this round's leak — but
+  that is an account state, not a design guarantee.
+
+- **Decision:** Sweep and scout emit **`atr_multiplier` instead of absolute `spacing`**; explicit
+  `spacing` no longer disables ATR refresh (it seeds the initial value).
+  **Why:** `should_fetch_atr` returns false when `spacing` is present, so the sweep-picked
+  absolute spacing pinned 0.12266071 for the entire 22-day session across changing volatility.
+  A multiplier stays volatility-adaptive by construction.
+
+- **Decision:** **Equity is computed from total wallet balances** (including order-locked
+  amounts), with periodic book-position vs wallet reconciliation, and the TUI gains a trailing
+  7-day PnL% readout.
+  **Why:** The user watched "300–320" while the real wallet held ~$345 (267.10 USD + 1.05 SOL);
+  the displayed equity understates reality (available-vs-total balance and book-vs-wallet
+  position drift). A weekly % readout makes the new target directly measurable.
+
+- **Decision:** **Add a second trading pair**, selected by scout at rollout time (volume/spread/
+  volatility filters plus preference for low correlation to SOL), with the shared-wallet budget
+  split across both runners.
+  **Why:** User's explicit choice (2026-07-29) to diversify regime risk; SOLUSD-only means one
+  asset's downtrend idles the whole account.
+
+- **Addendum (2026-07-29, same day):** User confirms **Bitfinex charges this account $0 fees,
+  permanently** — consistent with the wallet-delta reconciliation of live fills. Implications:
+  the live fee fetch (plan/10) is expected to resolve to 0 and that is correct, not an anomaly;
+  `min_profit_frac` (plan/09) is then the binding per-round-trip profit floor; sweeps/backtests
+  should be run with 0 fees to match reality (the non-zero CLI defaults remain only as a
+  safety fallback for fetch failure or other accounts).

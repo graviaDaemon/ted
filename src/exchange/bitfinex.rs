@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use tokio::time::Duration;
 
 use crate::api::candles::{fetch_candle_history, fetch_candles, Candle};
-use crate::api::endpoints::{cancel_order, fetch_open_orders, fetch_order_history, place_order};
+use crate::api::endpoints::{
+    cancel_order, fetch_account_fees, fetch_open_orders, fetch_order_history, place_order,
+};
 use crate::api::types::{OrderResult, TradeSignal, WsEvent};
 use crate::api::websocket::{connect_authenticated, parse_auth_ws_message, parse_ws_message};
 use crate::config::config::Config;
@@ -55,6 +57,12 @@ impl Exchange for Bitfinex {
 
     async fn fetch_order_history(&self, symbol: &str) -> Result<Vec<(i64, String)>, String> {
         fetch_order_history(symbol, &self.config, &self.http)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn fetch_account_fees(&self) -> Result<(f64, f64), String> {
+        fetch_account_fees(&self.config, &self.http)
             .await
             .map_err(|e| e.to_string())
     }

@@ -192,10 +192,12 @@ pub struct BacktestCommand {
     #[arg(long, default_value_t = 0.0)]
     pub spread: f64,
 
-    #[arg(long, default_value_t = 0.0)]
+    /// Maker fee fraction. Defaults to the standard tier (plan/10) — pass
+    /// `--maker-fee 0` explicitly for a zero-fee replay.
+    #[arg(long, default_value_t = 0.001)]
     pub maker_fee: f64,
 
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.002)]
     pub taker_fee: f64,
 
     #[arg(long, default_value_t = 10000.0)]
@@ -234,10 +236,12 @@ pub struct SweepCommand {
     #[arg(long, default_value_t = 0.0)]
     pub spread: f64,
 
-    #[arg(long, default_value_t = 0.0)]
+    /// Maker fee fraction. Defaults to the standard tier (plan/10) — pass
+    /// `--maker-fee 0` explicitly for a zero-fee sweep.
+    #[arg(long, default_value_t = 0.001)]
     pub maker_fee: f64,
 
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.002)]
     pub taker_fee: f64,
 
     /// Starting quote wallet for the replay; defaults to --capital.

@@ -30,6 +30,10 @@ struct StatusEntry {
     open_sells: usize,
     paused: bool,
     halted: bool,
+    fees_paid: f64,
+    open_lots: usize,
+    trend: Option<String>,
+    pnl_7d_pct: Option<f64>,
     bid: Option<f64>,
     active: bool,
 }
@@ -46,6 +50,10 @@ impl StatusEntry {
             open_sells: 0,
             paused: false,
             halted: false,
+            fees_paid: 0.0,
+            open_lots: 0,
+            trend: None,
+            pnl_7d_pct: None,
             bid: None,
             active: true,
         }
@@ -176,6 +184,10 @@ impl Tui {
                 open_sells,
                 paused,
                 halted,
+                fees_paid,
+                open_lots,
+                trend,
+                pnl_7d_pct,
             } => {
                 let entry = self.statuses.entry(symbol).or_insert_with(StatusEntry::new);
                 entry.mode = Some(mode);
@@ -187,6 +199,10 @@ impl Tui {
                 entry.open_sells = open_sells;
                 entry.paused = paused;
                 entry.halted = halted;
+                entry.fees_paid = fees_paid;
+                entry.open_lots = open_lots;
+                entry.trend = trend;
+                entry.pnl_7d_pct = pnl_7d_pct;
                 entry.active = true;
             }
             TuiEvent::RunnerStopped { symbol } => {
@@ -391,8 +407,21 @@ fn render_pnl_panel(frame: &mut Frame, area: Rect, statuses: &HashMap<String, St
                 .map(fmt_price)
                 .unwrap_or_else(|| "—".to_string()),
             format!("pos {}", fmt_qty(entry.position)),
+            format!("lots {}", entry.open_lots),
             format!("b{}/s{}", entry.open_buys, entry.open_sells),
             format!("eq {}", fmt_price(entry.equity)),
+            format!("fees {}", fmt_price(entry.fees_paid)),
+            format!(
+                "trend {}",
+                entry.trend.clone().unwrap_or_else(|| "—".to_string())
+            ),
+            format!(
+                "7d {}",
+                entry
+                    .pnl_7d_pct
+                    .map(|p| format!("{:+.2}%", p))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ),
         ];
         if entry.halted {
             parts.push("HALTED".to_string());

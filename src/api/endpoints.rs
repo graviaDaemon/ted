@@ -179,6 +179,61 @@ pub async fn fetch_order_history(
     Ok(pairs)
 }
 
+/// Fetch the account's exchange-trading maker/taker fee rates from the auth
+/// summary endpoint (plan/10). Bitfinex `/v2/auth/r/summary` responds with a
+/// positional array whose index 4 is the fees snapshot:
+/// `[[maker_crypto, maker_stable, maker_fiat, deriv_rebate],
+///   [taker_crypto, taker_stable, taker_fiat, deriv_fee]]` — the exchange
+/// crypto entries (index 0 of each) are what spot grid trading pays.
+pub async fn fetch_account_fees(
+    config: &Config,
+    client: &reqwest::Client,
+) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
+    let path = "/v2/auth/r/summary";
+    let nonce = Utc::now().timestamp_millis().to_string();
+    let body = String::new();
+    let sig = sign_rest_request(config.active_secret(config.credential_mode), path, &nonce, &body);
+    let url = format!("{}{}", config.api.auth_endpoint.trim_end_matches('/'), path);
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("bfx-nonce", &nonce)
+        .header("bfx-apikey", config.active_key(config.credential_mode))
+        .header("bfx-signature", &sig)
+        .body(body)
+        .send()
+        .await?;
+
+    let http_status = response.status();
+    let text = response.text().await?;
+
+    if !http_status.is_success() {
+        return Err(format!("HTTP {} fetching account summary: {}", http_status, text).into());
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse account summary: {} — raw: {}", e, text))?;
+
+    let fees = val
+        .get(4)
+        .ok_or_else(|| format!("Account summary has no fees block (index 4): {}", text))?;
+
+    // Logged once so the field mapping can be verified against the live account.
+    static FEE_BLOCK_LOGGED: std::sync::Once = std::sync::Once::new();
+    FEE_BLOCK_LOGGED.call_once(|| {
+        crate::logger::log_debug("[API]", &format!("Account summary fees block: {}", fees));
+    });
+
+    let maker = fees[0][0]
+        .as_f64()
+        .ok_or_else(|| format!("Account summary maker fee not numeric: {}", fees))?;
+    let taker = fees[1][0]
+        .as_f64()
+        .ok_or_else(|| format!("Account summary taker fee not numeric: {}", fees))?;
+    Ok((maker, taker))
+}
+
 pub async fn cancel_order(
     order_id: i64,
     config: &Config,

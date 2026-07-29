@@ -36,6 +36,11 @@ pub enum TuiEvent {
         open_sells: usize,
         paused: bool,
         halted: bool,
+        fees_paid: f64,
+        open_lots: usize,
+        trend: Option<String>,
+        /// Trailing 7-day PnL% from daily rollups; None with < 2 rollup days.
+        pnl_7d_pct: Option<f64>,
     },
     RunnerStopped {
         symbol: String,

@@ -33,7 +33,9 @@ pub struct RunnerState {
     pub pending_buy_orders: HashMap<i64, (f64, f64)>,
     pub pending_sell_orders: HashMap<i64, (f64, f64)>,
     pub trade_store: Option<crate::storage::TradeStore>,
-    pub wallet_balances: HashMap<String, f64>,
+    /// currency → (total, available). Total includes order-locked funds and is
+    /// the equity truth (plan/10); available is what can fund new orders.
+    pub wallet_balances: HashMap<String, (f64, f64)>,
     pub runner_db_id: Option<i64>,
     pub db: Option<Db>,
     pub last_bid: f64,
@@ -78,6 +80,22 @@ impl RunnerState {
 
     fn src(&self) -> String {
         format!("RUNNER:{}", self.symbol)
+    }
+
+    /// Wallet-truth equity (plan/10): total quote + total base × mid, including
+    /// order-locked amounts — the number the user could actually withdraw.
+    /// Falls back to the book position when no wallet is known (simulation).
+    pub fn wallet_equity(&self, mid: f64) -> f64 {
+        let (base, quote) = extract_currencies(&self.symbol);
+        let quote_total = self
+            .wallet_balances
+            .get(&quote)
+            .map(|&(t, _)| t)
+            .unwrap_or(0.0);
+        match self.wallet_balances.get(&base).map(|&(t, _)| t) {
+            Some(base_total) => quote_total + base_total * mid,
+            None => quote_total + self.algorithm.position() * mid,
+        }
     }
 
     /// Persist the resume blob (options, serialized algorithm state, pending
@@ -134,9 +152,57 @@ impl RunnerState {
         let fees = self.algorithm.fees_paid();
         let trades = self.algorithm.trade_count();
         let unrealized = self.algorithm.unrealized_pnl(mid);
-        let (_, quote) = extract_currencies(&self.symbol);
-        let quote_bal = self.wallet_balances.get(&quote).copied().unwrap_or(0.0);
-        let equity = quote_bal + position * mid;
+        let equity = self.wallet_equity(mid);
+
+        let now = Utc::now();
+        let ts = now.to_rfc3339();
+        let day = now.format("%Y-%m-%d").to_string();
+
+        // Book-vs-wallet reconciliation (plan/10): the strategy's position and
+        // the wallet's total base drift apart when fills are missed or booked
+        // out-of-band. Tolerate up to one resting exit's quantity (in-flight
+        // fills); warn — never auto-correct silently.
+        let (base, _) = extract_currencies(&self.symbol);
+        if let Some(&(wallet_base, _)) = self.wallet_balances.get(&base) {
+            let tolerance = self
+                .algorithm
+                .expected_exits()
+                .iter()
+                .filter_map(|s| match s {
+                    crate::api::TradeSignal::Sell { quantity, .. } => Some(*quantity),
+                    _ => None,
+                })
+                .fold(0.0_f64, f64::max)
+                .max(position.abs() * 0.01)
+                .max(1e-6);
+            if (position - wallet_base).abs() > tolerance {
+                crate::logger::log_warn(
+                    &self.src(),
+                    &format!(
+                        "Book position {:.8} vs wallet {} total {:.8} diverge by {:.8} (tolerance {:.8}) — check for missed or out-of-band fills.",
+                        position,
+                        base,
+                        wallet_base,
+                        (position - wallet_base).abs(),
+                        tolerance
+                    ),
+                );
+            }
+        }
+
+        // Trailing 7-day PnL% against the oldest rollup equity in the window
+        // (plan/10) — n/a until a prior day's rollup exists.
+        let pnl_7d_pct = self
+            .db
+            .as_ref()
+            .and_then(|db| db.equity_baseline(&self.symbol, 7).ok().flatten())
+            .and_then(|(base_day, base_eq)| {
+                if base_day != day && base_eq > 0.0 {
+                    Some((equity - base_eq) / base_eq * 100.0)
+                } else {
+                    None
+                }
+            });
 
         crate::logger::notify_tui(TuiEvent::Status {
             symbol: self.symbol.clone(),
@@ -149,6 +215,10 @@ impl RunnerState {
             open_sells: self.pending_sell_orders.len(),
             paused: self.paused,
             halted: self.halted,
+            fees_paid: fees,
+            open_lots: self.algorithm.open_lots(),
+            trend: self.algorithm.trend_state().map(str::to_string),
+            pnl_7d_pct,
         });
 
         let Some(runner_id) = self.runner_db_id else {
@@ -157,10 +227,6 @@ impl RunnerState {
         if self.db.is_none() {
             return;
         }
-
-        let now = Utc::now();
-        let ts = now.to_rfc3339();
-        let day = now.format("%Y-%m-%d").to_string();
 
         let needs_rebase = self.daily.as_ref().map(|d| d.day != day).unwrap_or(true);
         if needs_rebase {

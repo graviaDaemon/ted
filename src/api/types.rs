@@ -80,11 +80,15 @@ pub enum WsEvent {
         order_id: i64,
     },
     WalletSnapshot {
-        balances: Vec<(String, String, f64)>,
+        /// (wallet_type, currency, total, available) — total (index 2 of the
+        /// Bitfinex wallet array) includes order-locked funds; available
+        /// (index 4) is what can fund new orders.
+        balances: Vec<(String, String, f64, f64)>,
     },
     WalletUpdate {
         wallet_type: String,
         currency: String,
+        total: f64,
         available: f64,
     },
 }
