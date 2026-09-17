@@ -111,11 +111,18 @@ printf 'TOKEN runner -s tSOLUSD -f\n' | nc -N 127.0.0.1 8787   # finish-exits (r
 ```ini
 [Unit]
 Description=T.E.D headless trader
+Wants=network-online.target
 After=network-online.target ollama.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/YOU/ted
+# T.E.D resolves its data dir (ted.db, logs, trades) from $HOME/.local/share, and
+# systemd does NOT inherit your shell's $HOME. Pin it so the service uses the SAME
+# ted.db as your interactive/tmux runs — otherwise it starts a fresh DB and the
+# circuit breaker sees no daily_rollups. Set this to the home of whoever ran the
+# interactive T.E.D (e.g. /root when running as root; verify with `ls -la $HOME/.local/share/ted/`).
+Environment=HOME=/home/YOU
 ExecStart=/home/YOU/ted/target/release/ted --headless
 Restart=on-failure
 RestartSec=5
@@ -146,6 +153,7 @@ plain-text fallback, so it sends even if Ollama is down. Other providers work to
 
 ```bash
 git clone git@github.com:graviaDaemon/lara-raith.git && cd lara-raith
+node --version            # need Node >= 20.12 (older Node can't auto-load .env; upgrade to 22 LTS)
 npm ci --include=dev      # typescript/tsx are devDependencies; --include=dev builds even under NODE_ENV=production
 cp .env.example .env      # set TED_CONTROL_TOKEN to match config.json; TED_CHAT_MODEL=llama3.2:3b
 npm run build             # tsc → dist/ (if you get "tsc: not found", dev deps didn't install — see above)
