@@ -74,7 +74,12 @@ Copy `config.template.json` → `config.json` and fill in the `api` block and th
 }
 ```
 
-Generate a token: `openssl rand -hex 32`. Keep `config.json` private: `chmod 600 config.json`.
+**About the `control` block** — this is the headless control surface: the only way to
+drive a `--headless` T.E.D (there's no prompt). `bind` is the loopback address:port it
+listens on — keep it `127.0.0.1` so nothing off the VPS can reach it (Lara runs on the same
+box). `token` is a shared secret every command must carry (`<token> status`), and it **must
+match** Lara's `TED_CONTROL_TOKEN`. Generate one with `openssl rand -hex 32`. Keep
+`config.json` private: `chmod 600 config.json`.
 
 ## 4. Start T.E.D headless (paper)
 
@@ -83,6 +88,15 @@ Generate a token: `openssl rand -hex 32`. Keep `config.json` private: `chmod 600
 ```
 
 You should see `Headless operator running.` and `Control surface listening on 127.0.0.1:8787.`
+
+> **Headless vs. the TUI (and your tmux habit).** `./ted` with no flag is the interactive
+> TUI you drive in `tmux attach -t ted`. `./ted --headless` is a *different* run-mode: no
+> prompt — you interact over the control surface (below), not by attaching. Run only **one**
+> at a time on the same account/DB (a single engine owns the exchange connection). You can
+> still run `--headless` inside tmux if you prefer watching stdout and doing without systemd;
+> you just give up auto-restart and start-on-boot. Keep the plain-TUI tmux session for manual
+> poking — but stop the headless process first so they don't fight over the account.
+
 Test the surface (replace TOKEN):
 
 ```bash
@@ -132,11 +146,16 @@ plain-text fallback, so it sends even if Ollama is down. Other providers work to
 
 ```bash
 git clone git@github.com:graviaDaemon/lara-raith.git && cd lara-raith
-npm ci
+npm ci --include=dev      # typescript/tsx are devDependencies; --include=dev builds even under NODE_ENV=production
 cp .env.example .env      # set TED_CONTROL_TOKEN to match config.json; TED_CHAT_MODEL=llama3.2:3b
-npm run build
-node dist/cli.js ted-status      # read-only sanity check against the running T.E.D
-node dist/cli.js operate         # one health-check pass (Phase 0: read-only unless TED_OPERATOR_RETUNE=true)
+npm run build             # tsc → dist/ (if you get "tsc: not found", dev deps didn't install — see above)
+node dist/operator-main.js ted-status   # read-only sanity check against the running T.E.D
+node dist/operator-main.js operate      # one health-check pass (Phase 0: read-only unless TED_OPERATOR_RETUNE=true)
+# Runtime runs the compiled dist (no tsx needed). Optional: `npm prune --omit=dev` after building.
+#
+# NOTE: the operator has its own entry point (operator-main.js) that does NOT load the
+# vault's native sqlite stack (better-sqlite3 / sqlite-vec). Do not use `dist/cli.js` for
+# the operator — that entry pulls in the RAG DB you don't run on the VPS.
 ```
 
 Run `operate` on a timer (better than an in-process loop). `/etc/systemd/system/lara-operate.service`:
@@ -148,7 +167,7 @@ After=ted.service
 [Service]
 Type=oneshot
 WorkingDirectory=/home/YOU/lara-raith
-ExecStart=/usr/bin/node dist/cli.js operate
+ExecStart=/usr/bin/node dist/operator-main.js operate
 EnvironmentFile=/home/YOU/lara-raith/.env
 ```
 
