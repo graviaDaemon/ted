@@ -24,16 +24,16 @@
   "operator": {
     "runners": [
       {
-        "symbol": "tSOLUSD",
+        "symbol": "SOLUSD",
         "algorithm": "grid",
         "paper": true,
-        "options": { "atr_multiplier": "0.5", "atr_timeframe": "30m", "levels": "4", "capital": "150" }
+        "options": { "atr_multiplier": "0.5", "atr_timeframe": "30m", "atr_period": "14", "levels": "3", "capital": "170" }
       }
     ],
     "guardrails": {
       "max_monthly_loss_pct":            10.0,
       "max_capital_per_pair":            200.0,
-      "whitelisted_pairs":               ["tSOLUSD", "tXMRUSD"],
+      "whitelisted_pairs":               ["SOLUSD", "XMRUSD"],
       "min_days_between_config_changes": 14,
       "month_baseline_capital":          320.0
     },

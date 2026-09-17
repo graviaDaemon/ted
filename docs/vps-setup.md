@@ -47,22 +47,38 @@ cargo build --release                        # binary at target/release/ted
 
 - On Bitfinex, create an API key and **disable the Withdraw permission** — the key on
   the VPS must be physically unable to move funds. Enable Orders + Wallets (read) only.
-- For paper trading, put your paper credentials in `api.paper_key` / `api.paper_secret`
-  and set `startup_defaults.paper: true` (the manifest runners below also set `paper: true`).
+> **⚠️ "Paper" mode is NOT a dry run.** Only `Simulation` mode places no orders.
+> `Paper` and `Live` both send **real orders** — the *only* thing that makes Paper safe is
+> the engine using **paper credentials**. So for paper you MUST set `api.paper_key` /
+> `api.paper_secret` (a Bitfinex **Paper Trading sub-account** key) AND
+> `startup_defaults.paper: true`. If paper creds are missing it silently falls back to LIVE
+> (watch for `paper_key not set — falling back to live`), and your runners will trade real
+> money. After start, confirm the wallet log shows **`TESTUSD`**, not real `USD`.
+
+> **Symbols: no `t` prefix, and paper uses TEST symbols.** T.E.D adds the Bitfinex `t`
+> itself, so write `SOLUSD`, not `tSOLUSD` (writing `tSOLUSD` becomes `ttSOLUSD` →
+> `symbol: invalid`). Bitfinex **paper** trades TEST symbols funded in TESTUSD, e.g.
+> `TESTBTC:TESTUSD`, `TESTETH:TESTUSD` — check the paper UI for which exist. **Live** uses
+> plain names like `SOLUSD`.
+>
+> **Simulation mode needs an explicit `spacing`.** ATR is only fetched in Paper/Live, so a
+> `Simulation` runner (neither `paper` nor `live`, `startup_defaults.paper: false`) must set
+> an absolute `spacing` option (e.g. `"spacing": "2.0"`) instead of `atr_multiplier` — it
+> places no orders and is only for testing the pipeline on live prices.
 
 Copy `config.template.json` → `config.json` and fill in the `api` block and the new
-`operator` block. The template already has a working paper example; the parts to set:
+`operator` block. Paper example (TEST symbols, `startup_defaults.paper: true`):
 
 ```jsonc
 "operator": {
   "runners": [
-    { "symbol": "tSOLUSD", "algorithm": "grid", "paper": true,
-      "options": { "atr_multiplier": "0.5", "atr_timeframe": "30m", "levels": "4", "capital": "150" } }
+    { "symbol": "TESTBTC:TESTUSD", "algorithm": "grid", "paper": true,
+      "options": { "atr_multiplier": "0.5", "atr_timeframe": "30m", "atr_period": "14", "levels": "3", "capital": "170" } }
   ],
   "guardrails": {
     "max_monthly_loss_pct":            10.0,     // breaker trips past this MTD realized loss
     "max_capital_per_pair":            200.0,    // governor rejects bigger allocations
-    "whitelisted_pairs":               ["tSOLUSD", "tXMRUSD"],
+    "whitelisted_pairs":               ["TESTBTC:TESTUSD", "TESTETH:TESTUSD"],
     "min_days_between_config_changes": 14,       // anti-churn / overfit-chasing
     "month_baseline_capital":          320.0     // denominator for the monthly-loss %
   },
@@ -101,7 +117,7 @@ Test the surface (replace TOKEN):
 
 ```bash
 printf 'TOKEN status\n' | nc -N 127.0.0.1 8787      # JSON: equity, MTD PnL, per-runner, hold flag
-printf 'TOKEN runner -s tSOLUSD -f\n' | nc -N 127.0.0.1 8787   # finish-exits (retire when flat)
+printf 'TOKEN runner -s TESTBTC:TESTUSD -f\n' | nc -N 127.0.0.1 8787   # finish-exits (retire when flat)
 ```
 
 ### Run it under systemd
