@@ -59,6 +59,13 @@ pub enum RunnerControl {
     Pause,
     Resume,
     Kill,
+    /// Circuit-breaker halt (plan/12): stop opening new buys, cancel resting buys,
+    /// keep the exit ladder resting. Same state as the drawdown halt; cleared by
+    /// `Resume`. Triggered account-wide by the monthly breaker.
+    HaltBuys,
+    /// Retire this pair cleanly (plan/12): stop opening, keep working the exit
+    /// ladder, and shut the runner down once flat (position ≈ 0, no resting sells).
+    FinishExits,
     /// Clean app-wide shutdown (Ctrl-D / restart): persist resume state and exit
     /// WITHOUT cancelling resting orders, so the next launch reconciles against
     /// them. Distinct from `Kill`, which cancels orders and forgets the runner.

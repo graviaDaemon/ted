@@ -10,9 +10,13 @@ mod tui;
 mod util;
 mod engine;
 mod exchange;
+mod operator;
+mod notify;
 
-use crate::config::config::{Config, CredentialMode};
+use crate::config::config::{Config, CredentialMode, OperatorConfig};
 use crate::config::channels::{RunnerControl, RunnerMode, TuiEvent};
+use crate::storage::db::Db;
+use std::path::Path;
 use crate::logger::LogLevel;
 use crate::commands::cli::{Cli, CliAction};
 use crate::engine::spawn_engine;
@@ -93,6 +97,17 @@ async fn main() {
     // engine, runners, and algorithms would not change.
     let exchange: Arc<dyn Exchange> = Arc::new(Bitfinex::new(config.clone()));
     let (engine_handle, _engine_join) = spawn_engine(exchange.clone());
+
+    // Headless operator mode (plan/12): no TUI — spawn the manifest, run the
+    // circuit breaker, and take commands over the control surface.
+    if std::env::args().any(|a| a == "--headless") {
+        if let Err(e) = config.validate_operator() {
+            eprintln!("Invalid operator config for --headless: {}", e);
+            std::process::exit(1);
+        }
+        run_headless(config, engine_handle, exchange, log_rx, tui_rx).await;
+        return;
+    }
 
     let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
     let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
@@ -281,6 +296,16 @@ async fn dispatch(
                 RunnerControl::SetAlgorithm { name: algorithm, options },
             )
             .await;
+        }
+
+        CliAction::FinishExits { symbol } => {
+            send_control(runner_txs, runner_handles, &symbol, RunnerControl::FinishExits).await;
+        }
+
+        CliAction::Status | CliAction::ClearHold => {
+            // Operator-level verbs — the headless control surface intercepts these
+            // before dispatch; in the TUI they are not meaningful.
+            logger::log("[CTRL]", "status/clear-hold are only available over the headless control surface.");
         }
 
         CliAction::Generate { symbol, all, verbose } => {
@@ -502,5 +527,275 @@ async fn dispatch(
         }
 
         CliAction::Exit => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headless operator (plan/12): no TUI. Spawns the manifest, runs the monthly
+// circuit breaker, and serves the control surface — all reusing the dispatch
+// path above. Strategic decisions live in Lara; this only executes and guards.
+// ---------------------------------------------------------------------------
+
+async fn run_headless(
+    config: Config,
+    engine_handle: crate::engine::EngineHandle,
+    exchange: Arc<dyn Exchange>,
+    mut log_rx: tokio::sync::mpsc::Receiver<String>,
+    mut tui_rx: tokio::sync::mpsc::Receiver<TuiEvent>,
+) {
+    let op = config.operator.clone().expect("validated operator config");
+    let db_path = crate::storage::data_dir().join("ted.db");
+
+    let mut runner_txs: HashMap<String, Sender<RunnerControl>> = HashMap::new();
+    let mut runner_handles: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut status_cache: crate::operator::StatusCache = HashMap::new();
+
+    // Spawn the startup manifest by reusing the line dispatcher.
+    for spec in &op.runners {
+        let mut line = format!("runner -s {} -a {}", spec.symbol, spec.algorithm);
+        for (k, v) in &spec.options {
+            line.push_str(&format!(" -o {}={}", k, v));
+        }
+        if spec.live {
+            line.push_str(" --live");
+        } else if spec.paper {
+            line.push_str(" --paper");
+        }
+        dispatch_line(&mut runner_txs, &mut runner_handles, &line, &config, &engine_handle, &exchange).await;
+    }
+
+    // A persisted hold survives restart: re-halt on boot so a crash never
+    // silently resumes trading.
+    let held_on_boot = Db::open(&db_path)
+        .ok()
+        .and_then(|db| db.operator_state().ok())
+        .map(|s| s.hold)
+        .unwrap_or(false);
+    if held_on_boot {
+        logger::log_critical(
+            "[CTRL]",
+            "Circuit-breaker hold is set — halting new buys on boot. Clear the hold to resume.",
+        );
+        let syms: Vec<String> = runner_txs.keys().cloned().collect();
+        for s in &syms {
+            send_control(&mut runner_txs, &mut runner_handles, s, RunnerControl::HaltBuys).await;
+        }
+    }
+
+    let (cmd_tx, mut cmd_rx) = channel::<crate::operator::control::ControlRequest>(32);
+    tokio::spawn(crate::operator::control::listen(op.control.clone(), cmd_tx));
+
+    let mut breaker_tick = tokio::time::interval(Duration::from_secs(op.breaker_interval_secs.max(30)));
+
+    logger::log("[CTRL]", "Headless operator running.");
+
+    loop {
+        select! {
+            Some(req) = cmd_rx.recv() => {
+                let reply = handle_control_command(
+                    &req.command, &op, &db_path,
+                    &mut runner_txs, &mut runner_handles, &status_cache,
+                    &config, &engine_handle, &exchange,
+                ).await;
+                let _ = req.reply.send(reply);
+            }
+
+            _ = breaker_tick.tick() => {
+                run_breaker_check(&op, &db_path, &mut runner_txs, &mut runner_handles).await;
+            }
+
+            msg = log_rx.recv() => {
+                if let Some(line) = msg { println!("{}", line); }
+            }
+
+            msg = tui_rx.recv() => {
+                if let Some(ev) = msg { apply_tui_event(&mut status_cache, ev); }
+            }
+
+            _ = shutdown_signal() => {
+                logger::log("[CTRL]", "Shutdown signal — persisting state, leaving orders resting.");
+                break;
+            }
+        }
+    }
+
+    graceful_shutdown(&mut runner_txs, &mut runner_handles).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_command(
+    command: &str,
+    op: &OperatorConfig,
+    db_path: &Path,
+    runner_txs: &mut HashMap<String, Sender<RunnerControl>>,
+    runner_handles: &mut HashMap<String, JoinHandle<()>>,
+    status_cache: &crate::operator::StatusCache,
+    config: &Config,
+    engine_handle: &crate::engine::EngineHandle,
+    exchange: &Arc<dyn Exchange>,
+) -> String {
+    let args: Vec<&str> = std::iter::once("ted").chain(command.split_whitespace()).collect();
+    let cmd = match Cli::try_parse_from(args) {
+        Ok(c) => c,
+        Err(e) => return format!("ERR {}", e.to_string().replace('\n', " ")),
+    };
+    let action = match cmd.handle_command() {
+        Ok(a) => a,
+        Err(e) => return format!("ERR {}", e),
+    };
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => return format!("ERR db: {}", e),
+    };
+    let now = chrono::Utc::now();
+
+    match &action {
+        CliAction::Status => {
+            let (net, loss) = crate::operator::breaker::evaluate(&db, op, now)
+                .map(|o| (o.net_realized, o.loss_pct))
+                .unwrap_or((0.0, 0.0));
+            let st = db.operator_state().ok();
+            let (hold, reason, last) = st
+                .map(|s| (s.hold, s.hold_reason, s.last_config_change))
+                .unwrap_or((false, None, None));
+            return crate::operator::status_json(
+                status_cache, hold, reason.as_deref(), last.as_deref(), net, loss,
+            );
+        }
+        CliAction::ClearHold => {
+            let loss = crate::operator::breaker::evaluate(&db, op, now)
+                .map(|o| o.loss_pct)
+                .unwrap_or(0.0);
+            if let Err(e) = crate::operator::guardrails::can_clear_hold(op, loss) {
+                return format!("ERR {}", e);
+            }
+            if let Err(e) = db.clear_hold() {
+                return format!("ERR {}", e);
+            }
+            let syms: Vec<String> = runner_txs.keys().cloned().collect();
+            for s in &syms {
+                send_control(runner_txs, runner_handles, s, RunnerControl::Resume).await;
+            }
+            return "OK hold cleared, runners resumed".to_string();
+        }
+        _ => {}
+    }
+
+    let last_change = db
+        .operator_state()
+        .ok()
+        .and_then(|s| s.last_config_change)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    if let Err(e) = crate::operator::guardrails::check(&action, op, now, last_change) {
+        return format!("ERR {}", e);
+    }
+    let is_config_change = matches!(action, CliAction::Spawn { .. } | CliAction::Configure { .. });
+    dispatch(runner_txs, runner_handles, action, config, engine_handle, exchange).await;
+    if is_config_change {
+        let _ = db.record_config_change(&now.to_rfc3339());
+    }
+    "OK".to_string()
+}
+
+async fn run_breaker_check(
+    op: &OperatorConfig,
+    db_path: &Path,
+    runner_txs: &mut HashMap<String, Sender<RunnerControl>>,
+    runner_handles: &mut HashMap<String, JoinHandle<()>>,
+) {
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            logger::log_warn("[CTRL]", &format!("breaker db open failed: {}", e));
+            return;
+        }
+    };
+    let now = chrono::Utc::now();
+    let out = match crate::operator::breaker::evaluate(&db, op, now) {
+        Ok(o) => o,
+        Err(e) => {
+            logger::log_warn("[CTRL]", &format!("breaker evaluate failed: {}", e));
+            return;
+        }
+    };
+    if !out.tripped {
+        return;
+    }
+    let reason = format!(
+        "monthly loss {:.2}% exceeds {:.2}% (net realized {:.2} on baseline {:.2})",
+        out.loss_pct, op.guardrails.max_monthly_loss_pct, out.net_realized, out.baseline
+    );
+    logger::log_critical(
+        "[CTRL]",
+        &format!("CIRCUIT BREAKER TRIPPED: {}. Halting new buys account-wide; hold set (clear manually to resume).", reason),
+    );
+    let _ = db.set_hold(&reason);
+    let syms: Vec<String> = runner_txs.keys().cloned().collect();
+    for s in &syms {
+        send_control(runner_txs, runner_handles, s, RunnerControl::HaltBuys).await;
+    }
+
+    let email = op.email.clone();
+    let ollama = op.ollama.clone();
+    let fallback = format!(
+        "T.E.D circuit breaker tripped.\n\n{}\n\nNew buys are halted account-wide; resting exits remain. \
+         Trading stays on hold until it is manually cleared. Time to re-evaluate the engineering.",
+        reason
+    );
+    tokio::spawn(async move {
+        let prompt = format!(
+            "Write a short, calm operator alert email (5-8 sentences) for the owner of an automated crypto grid \
+             bot and their engineer. The bot just hit its monthly-loss circuit breaker and paused opening new \
+             positions. State the situation plainly and that a re-evaluation is needed. Facts: {}",
+            fallback
+        );
+        let body = crate::notify::narrate(ollama.as_ref(), &prompt, &fallback).await;
+        if let Err(e) = crate::notify::send_email(email.as_ref(), "T.E.D circuit breaker tripped", &body).await {
+            logger::log_warn("[NOTIFY]", &format!("Breach email failed: {}", e));
+        }
+    });
+}
+
+fn apply_tui_event(cache: &mut crate::operator::StatusCache, ev: TuiEvent) {
+    match ev {
+        TuiEvent::Status {
+            symbol, mode, realized, unrealized, equity, position,
+            open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct,
+        } => {
+            cache.insert(
+                symbol.clone(),
+                crate::operator::StatusSnapshot {
+                    symbol, mode, realized, unrealized, equity, position,
+                    open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct,
+                },
+            );
+        }
+        TuiEvent::RunnerStopped { symbol } => {
+            cache.remove(&symbol);
+        }
+        _ => {}
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

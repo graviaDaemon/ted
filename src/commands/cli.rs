@@ -24,6 +24,9 @@ impl Cli {
                 if run.resume {
                     return Ok(CliAction::Resume { symbol });
                 }
+                if run.finish_exits {
+                    return Ok(CliAction::FinishExits { symbol });
+                }
                 if let Some(alg) = &run.configure {
                     return Ok(CliAction::Configure {
                         symbol,
@@ -82,6 +85,8 @@ impl Cli {
                     start_base: sw.start_base,
                 })
             }
+            RunCommand::Status => Ok(CliAction::Status),
+            RunCommand::ClearHold => Ok(CliAction::ClearHold),
             RunCommand::Exit => Ok(CliAction::Exit),
         }
     }
@@ -120,6 +125,10 @@ pub enum RunCommand {
     Generate(GenerateCommand),
     Backtest(BacktestCommand),
     Sweep(SweepCommand),
+    /// Headless control surface (plan/12): JSON account/runner status.
+    Status,
+    /// Headless control surface (plan/12): clear a circuit-breaker hold.
+    ClearHold,
     Exit,
 }
 
@@ -155,6 +164,10 @@ pub struct RunnerCommand {
     /// Ignore any saved resume state for this symbol and start a fresh grid.
     #[arg(long)]
     pub fresh: bool,
+
+    /// Stop opening, work exits until flat, then retire the runner (plan/12).
+    #[arg(short = 'f', long, conflicts_with_all(["pause", "resume", "kill"]))]
+    pub finish_exits: bool,
 }
 
 #[derive(Args, Debug)]
@@ -275,6 +288,11 @@ pub enum CliAction {
         algorithm: String,
         options: HashMap<String, String>,
     },
+    FinishExits {
+        symbol: String,
+    },
+    Status,
+    ClearHold,
     Generate {
         symbol: Option<String>,
         all: bool,

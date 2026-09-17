@@ -1,5 +1,10 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Once;
+
+fn default_breaker_interval_secs() -> u64 {
+    900
+}
 
 fn default_throttle_ms() -> u64 {
     300
@@ -80,10 +85,81 @@ pub struct StartupDefaults {
     pub paper: bool,
 }
 
+/// Headless-operator config (plan/12). Absent for the interactive TUI; required
+/// for `ted --headless`. All list/optional fields default so a partial block is
+/// still valid.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OperatorConfig {
+    #[serde(default)]
+    pub runners: Vec<RunnerSpec>,
+    pub guardrails: Guardrails,
+    pub control: ControlConfig,
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+    #[serde(default)]
+    pub ollama: Option<OllamaConfig>,
+    #[serde(default = "default_breaker_interval_secs")]
+    pub breaker_interval_secs: u64,
+}
+
+/// One entry in the headless startup manifest — spawned at boot.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RunnerSpec {
+    pub symbol: String,
+    pub algorithm: String,
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+    #[serde(default)]
+    pub paper: bool,
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// Hard limits T.E.D enforces on every control-surface command (the governor)
+/// and the monthly circuit breaker. Un-bypassable by the operating agent.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Guardrails {
+    pub max_monthly_loss_pct: f64,
+    pub max_capital_per_pair: f64,
+    #[serde(default)]
+    pub whitelisted_pairs: Vec<String>,
+    #[serde(default)]
+    pub min_days_between_config_changes: i64,
+    /// Seed for the monthly-loss denominator on first run / month rollover.
+    pub month_baseline_capital: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlConfig {
+    /// Loopback bind address, e.g. "127.0.0.1:8787".
+    pub bind: String,
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmailConfig {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub user: String,
+    pub pass: String,
+    pub from: String,
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub starttls: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OllamaConfig {
+    pub endpoint: String,
+    pub model: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub api: ApiConfig,
     pub startup_defaults: StartupDefaults,
+    #[serde(default)]
+    pub operator: Option<OperatorConfig>,
     /// Set at startup from `startup_defaults.paper`; never read from JSON.
     #[serde(skip)]
     pub credential_mode: CredentialMode,
@@ -173,6 +249,27 @@ impl Config {
         // optional: active_key/active_secret fall back to the live pair with a
         // one-time warning. Nothing to hard-fail here.
         Ok(())
+    }
+
+    /// Extra checks required only for `ted --headless`. The TUI never calls this.
+    pub fn validate_operator(&self) -> Result<&OperatorConfig, String> {
+        let op = self
+            .operator
+            .as_ref()
+            .ok_or("headless mode requires an \"operator\" section in config.json")?;
+        if op.control.bind.trim().is_empty() {
+            return Err("operator.control.bind is empty".into());
+        }
+        if op.control.token.trim().is_empty() {
+            return Err("operator.control.token is empty (needed to authenticate the agent)".into());
+        }
+        if op.guardrails.max_monthly_loss_pct <= 0.0 {
+            return Err("operator.guardrails.max_monthly_loss_pct must be > 0".into());
+        }
+        if op.guardrails.month_baseline_capital <= 0.0 {
+            return Err("operator.guardrails.month_baseline_capital must be > 0".into());
+        }
+        Ok(op)
     }
 }
 

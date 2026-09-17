@@ -126,6 +126,16 @@ impl Db {
                 pending_sells TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS operator_state (
+                id                    INTEGER PRIMARY KEY CHECK (id = 1),
+                hold                  INTEGER NOT NULL DEFAULT 0,
+                hold_reason           TEXT,
+                hold_since            TEXT,
+                last_config_change    TEXT,
+                month_baseline_equity REAL,
+                month_baseline_month  TEXT
+            );
+            INSERT OR IGNORE INTO operator_state (id, hold) VALUES (1, 0);
         ",
         )?;
         Ok(Db { conn })
@@ -331,6 +341,82 @@ impl Db {
         self.conn
             .execute("DELETE FROM snapshots WHERE ts < ?1", params![cutoff])
     }
+
+    /// The single operator-state row (persisted circuit-breaker hold + baselines).
+    pub fn operator_state(&self) -> Result<OperatorStateRow, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT hold, hold_reason, hold_since, last_config_change, month_baseline_equity, month_baseline_month \
+             FROM operator_state WHERE id = 1",
+            [],
+            |row| {
+                Ok(OperatorStateRow {
+                    hold: row.get::<_, i64>(0)? != 0,
+                    hold_reason: row.get(1)?,
+                    hold_since: row.get(2)?,
+                    last_config_change: row.get(3)?,
+                    month_baseline_equity: row.get(4)?,
+                    month_baseline_month: row.get(5)?,
+                })
+            },
+        )
+    }
+
+    pub fn set_hold(&self, reason: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE operator_state SET hold = 1, hold_reason = ?1, hold_since = ?2 WHERE id = 1",
+            params![reason, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_hold(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE operator_state SET hold = 0, hold_reason = NULL, hold_since = NULL WHERE id = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_config_change(&self, ts: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE operator_state SET last_config_change = ?1 WHERE id = 1",
+            params![ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_month_baseline(&self, equity: f64, month: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE operator_state SET month_baseline_equity = ?1, month_baseline_month = ?2 WHERE id = 1",
+            params![equity, month],
+        )?;
+        Ok(())
+    }
+
+    /// Net realized PnL (realized minus fees) summed across all runners for every
+    /// daily rollup on or after `since_day` (a "YYYY-MM-DD" string). The honest,
+    /// additive month-to-date figure for the circuit breaker — avoids
+    /// double-counting a wallet shared across pairs.
+    pub fn realized_since(&self, since_day: &str) -> Result<f64, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(realized_pnl - fees), 0.0) FROM daily_rollups WHERE day >= ?1",
+            params![since_day],
+            |row| row.get(0),
+        )
+    }
+}
+
+/// The single-row operator state (plan/12): persisted circuit-breaker hold so a
+/// restart never silently resumes trading, plus config-change and month baselines.
+#[derive(Debug, Clone)]
+pub struct OperatorStateRow {
+    pub hold: bool,
+    pub hold_reason: Option<String>,
+    #[allow(dead_code)]
+    pub hold_since: Option<String>,
+    pub last_config_change: Option<String>,
+    pub month_baseline_equity: Option<f64>,
+    pub month_baseline_month: Option<String>,
 }
 
 #[cfg(test)]
@@ -366,6 +452,12 @@ mod tests {
                 options TEXT NOT NULL, algo_state TEXT, pending_buys TEXT NOT NULL,
                 pending_sells TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE operator_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1), hold INTEGER NOT NULL DEFAULT 0,
+                hold_reason TEXT, hold_since TEXT, last_config_change TEXT,
+                month_baseline_equity REAL, month_baseline_month TEXT
+            );
+            INSERT OR IGNORE INTO operator_state (id, hold) VALUES (1, 0);
         ",
         )
         .unwrap();
@@ -552,6 +644,43 @@ mod tests {
         assert_eq!(recent[0].filled_at, "2026-07-07T12:00:00Z");
         assert_eq!(recent[1].symbol, "tXAUT:USD");
         assert_eq!(recent[1].realized_pnl, None);
+    }
+
+    #[test]
+    fn operator_state_hold_and_realized_since() {
+        let db = mem_db();
+        // Default row: not held.
+        let st = db.operator_state().unwrap();
+        assert!(!st.hold);
+
+        db.set_hold("monthly loss -12%").unwrap();
+        let st = db.operator_state().unwrap();
+        assert!(st.hold);
+        assert_eq!(st.hold_reason.as_deref(), Some("monthly loss -12%"));
+
+        db.clear_hold().unwrap();
+        assert!(!db.operator_state().unwrap().hold);
+
+        db.set_month_baseline(320.0, "2026-09").unwrap();
+        let st = db.operator_state().unwrap();
+        assert_eq!(st.month_baseline_equity, Some(320.0));
+        assert_eq!(st.month_baseline_month.as_deref(), Some("2026-09"));
+
+        // realized_since sums realized minus fees, filtered by day.
+        for (day, realized, fees) in [("2026-09-01", 10.0, 1.0), ("2026-09-15", -30.0, 2.0)] {
+            db.upsert_daily_rollup(&DailyRollup {
+                runner_id: 1,
+                day: day.to_string(),
+                realized_pnl: realized,
+                fees,
+                trades: 1,
+                ending_equity: 300.0,
+                ending_position: 0.0,
+            })
+            .unwrap();
+        }
+        let net = db.realized_since("2026-09-01").unwrap();
+        assert!((net - (10.0 - 1.0 + -30.0 - 2.0)).abs() < 1e-9, "net was {}", net);
     }
 
     #[test]

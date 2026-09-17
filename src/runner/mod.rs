@@ -473,6 +473,7 @@ pub async fn run_runner(
         max_drawdown_pct,
         peak_equity: 0.0,
         halted: false,
+        finishing: false,
         daily: None,
     };
 
@@ -713,6 +714,22 @@ pub async fn run_runner(
                         }
                     }
 
+                    Some(RunnerControl::HaltBuys) => {
+                        // Circuit-breaker halt: identical to the drawdown-halt path
+                        // (cancel resting buys, keep exits). `Resume` clears it.
+                        if !state.halted {
+                            state.halted = true;
+                            crate::logger::log_critical(&src, "HaltBuys received — halting new buys, cancelling resting buys, exits stay resting.");
+                            cancel_live_buy_orders(&mut state, &engine).await;
+                        }
+                    }
+
+                    Some(RunnerControl::FinishExits) => {
+                        state.finishing = true;
+                        crate::logger::log(&src, "FinishExits received — stop opening, working exits until flat, then retire.");
+                        cancel_live_buy_orders(&mut state, &engine).await;
+                    }
+
                     Some(RunnerControl::SetAlgorithm { name, options }) => {
                         match build_algorithm(&name, &options) {
                             Ok(new_algo) => {
@@ -742,6 +759,15 @@ pub async fn run_runner(
                 }
             }
         }
+
+        // FinishExits: once flat with no resting sells, retire the runner cleanly.
+        if state.finishing && is_flat(&state) {
+            crate::logger::log(&src, "FinishExits complete — flat, no resting sells. Retiring runner.");
+            state.save_state();
+            engine.unsubscribe(symbol.clone()).await;
+            crate::logger::notify_tui(TuiEvent::RunnerStopped { symbol: symbol.clone() });
+            break;
+        }
     }
 }
 
@@ -759,7 +785,10 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
         return;
     }
 
-    let signals = state.algorithm.on_tick(&market_data);
+    let mut signals = state.algorithm.on_tick(&market_data);
+    if state.finishing {
+        signals = finishing_filter(signals);
+    }
 
     dispatch_signals(state, &signals, engine).await;
 
@@ -898,9 +927,33 @@ async fn process_fill(state: &mut RunnerState, engine: &EngineHandle, order_id: 
         }
         vec![]
     };
+    let fill_signals = if state.finishing {
+        finishing_filter(fill_signals)
+    } else {
+        fill_signals
+    };
     if !fill_signals.is_empty() {
         dispatch::dispatch_signals(state, &fill_signals, engine).await;
     }
+}
+
+/// Keep only exit-side signals while a runner is finishing (plan/12): sells and
+/// buy-cancels reduce/close inventory; new buys and sell-cancels are dropped so
+/// the runner drifts to flat and retires.
+fn finishing_filter(signals: Vec<crate::api::types::TradeSignal>) -> Vec<crate::api::types::TradeSignal> {
+    use crate::api::types::TradeSignal;
+    signals
+        .into_iter()
+        .filter(|s| matches!(s, TradeSignal::Sell { .. } | TradeSignal::Cancel { is_buy: true, .. }))
+        .collect()
+}
+
+/// A finishing runner is done when it holds no position and has no resting sells.
+fn is_flat(state: &RunnerState) -> bool {
+    // ponytail: fixed dust epsilon; if a pair ever needs a per-symbol threshold,
+    // thread it from min_notional here.
+    const FLAT_EPS: f64 = 1e-8;
+    state.pending_sell_orders.is_empty() && state.algorithm.position().abs() < FLAT_EPS
 }
 
 fn process_cancelled(state: &mut RunnerState, order_id: i64) {

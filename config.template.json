@@ -19,5 +19,35 @@
     "default_maker_fee":       0.001,
     "default_taker_fee":       0.002,
     "paper":                   false
+  },
+
+  "operator": {
+    "runners": [
+      {
+        "symbol": "tSOLUSD",
+        "algorithm": "grid",
+        "paper": true,
+        "options": { "atr_multiplier": "0.5", "atr_timeframe": "30m", "levels": "4", "capital": "150" }
+      }
+    ],
+    "guardrails": {
+      "max_monthly_loss_pct":            10.0,
+      "max_capital_per_pair":            200.0,
+      "whitelisted_pairs":               ["tSOLUSD", "tXMRUSD"],
+      "min_days_between_config_changes": 14,
+      "month_baseline_capital":          320.0
+    },
+    "control": { "bind": "127.0.0.1:8787", "token": "change-me-to-a-long-random-string" },
+    "email": {
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "starttls":  true,
+      "user":      "you@gmail.com",
+      "pass":      "your-16-char-app-password",
+      "from":      "you@gmail.com",
+      "to":        ["you@gmail.com"]
+    },
+    "ollama": { "endpoint": "http://127.0.0.1:11434", "model": "llama3.2:3b" },
+    "breaker_interval_secs": 900
   }
 }

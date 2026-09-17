@@ -45,6 +45,9 @@ pub struct RunnerState {
     pub max_drawdown_pct: Option<f64>,
     pub peak_equity: f64,
     pub halted: bool,
+    /// FinishExits mode (plan/12): stop opening, keep exits, retire when flat.
+    /// Not persisted — a restart mid-finish resumes normal trading, which is safe.
+    pub finishing: bool,
     pub daily: Option<DailyAgg>,
 }
 
