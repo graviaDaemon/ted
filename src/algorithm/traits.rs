@@ -6,6 +6,14 @@ use std::collections::HashMap;
 pub trait Algorithm: Send {
     fn name(&self) -> &str;
     fn on_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal>;
+    /// Exit-only maintenance while the runner is halted (plan/13). The runner has
+    /// cancelled resting buys and adds no new exposure, but the strategy may still
+    /// need to re-price stranded exits (bounded capitulation) so a halted runner
+    /// can reach flat instead of freezing until a manual resume. Must never emit a
+    /// new buy. Default: do nothing.
+    fn on_halt_tick(&mut self, _tick: &MarketData) -> Vec<TradeSignal> {
+        vec![]
+    }
     fn on_fill(&mut self, _price: f64, _is_buy: bool, _current_price: f64) -> Vec<TradeSignal> {
         vec![]
     }

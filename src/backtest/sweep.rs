@@ -208,6 +208,7 @@ impl SweepResult {
     fn default_knobs(&self) -> String {
         "min_profit_frac=0.001 downtrend_levels=1 downtrend_qty_frac=0.5 \
          max_inventory_frac=0.75 max_inventory_frac_down=0.5 max_drawdown_pct=0.2 \
+         capitulate_enabled=true capitulate_band=6.0 max_lot_loss_frac=0.03 \
          trend_filter=ema trend_threshold=0.005 allow_unprofitable=false"
             .to_string()
     }

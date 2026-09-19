@@ -781,12 +781,17 @@ async fn process_tick(state: &mut RunnerState, engine: &EngineHandle, market_dat
 
     crate::logger::update_ticker(state.symbol.clone(), market_data.bid);
 
-    if check_risk(state, engine).await {
-        return;
-    }
-
-    let mut signals = state.algorithm.on_tick(&market_data);
-    if state.finishing {
+    // A halted runner (drawdown brake or circuit breaker) no longer freezes:
+    // it runs exit-only maintenance (plan/13 bounded capitulation) so stranded
+    // lots can be cut to flat instead of hanging until a manual resume. The halt
+    // path adds no new buys — `on_halt_tick` emits only exits.
+    let halted = check_risk(state, engine).await;
+    let mut signals = if halted {
+        state.algorithm.on_halt_tick(&market_data)
+    } else {
+        state.algorithm.on_tick(&market_data)
+    };
+    if state.finishing && !halted {
         signals = finishing_filter(signals);
     }
 

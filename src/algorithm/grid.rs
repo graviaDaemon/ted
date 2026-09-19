@@ -131,6 +131,14 @@ pub struct GridBot {
     recenter_band: f64,
     last_rebuild_at: Option<DateTime<Utc>>,
 
+    // Plan/13 bounded capitulation: when the runner is stuck one-sided, a lot
+    // whose entry is `capitulate_band × spacing` or more above the mid can never
+    // be recovered by averaging down; its exit is re-priced down to a marketable
+    // level floored at `unit_cost × (1 - max_lot_loss_frac)`, capping the loss.
+    capitulate_enabled: bool,
+    capitulate_band: f64,
+    max_lot_loss_frac: f64,
+
     emitted_buy_prices: HashSet<u64>,
     emitted_sell_prices: HashSet<u64>,
 }
@@ -291,6 +299,23 @@ impl GridBot {
             .filter(|v| *v > 0.0)
             .unwrap_or(2.5);
 
+        let capitulate_enabled = options
+            .get("capitulate_enabled")
+            .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+            .unwrap_or(true);
+
+        let capitulate_band = options
+            .get("capitulate_band")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(6.0);
+
+        let max_lot_loss_frac = options
+            .get("max_lot_loss_frac")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v >= 0.0 && *v < 1.0)
+            .unwrap_or(0.03);
+
         let max_position = options
             .get("max_position")
             .and_then(|v| v.parse::<f64>().ok())
@@ -342,6 +367,9 @@ impl GridBot {
             cap_logged: false,
             recenter_band,
             last_rebuild_at: None,
+            capitulate_enabled,
+            capitulate_band,
+            max_lot_loss_frac,
             emitted_buy_prices: HashSet::new(),
             emitted_sell_prices: HashSet::new(),
         })
@@ -822,6 +850,81 @@ impl GridBot {
             .any(|&(p, _)| (p - mid).abs() <= band)
     }
 
+    /// Bounded capitulation (plan/13). When `stuck` (the runner is `unfundable`,
+    /// has no resting buys, or is halted), re-price the exit of any lot whose
+    /// entry sits `capitulate_band × spacing` or more above `mid` down to a
+    /// marketable level, floored at `unit_cost × (1 - max_lot_loss_frac)` so the
+    /// realized loss on that lot is bounded. Cutting a stranded lot frees budget
+    /// and keeps the runner two-sided instead of hanging one-sided forever. Emits
+    /// only sell cancels + sells — never a new buy — so it is safe while halted.
+    fn capitulate(&mut self, mid: f64, stuck: bool) -> Vec<TradeSignal> {
+        if !self.capitulate_enabled || !stuck || mid <= 0.0 {
+            return vec![];
+        }
+        let trigger = self.capitulate_band * self.spacing;
+        let m = 10_f64.powi(self.price_decimals as i32);
+        let prec = self.price_decimals as usize;
+
+        let mut any = false;
+        for lot in self.book.lots.iter_mut() {
+            if lot.qty <= 0.0 || mid > lot.entry_price - trigger {
+                continue;
+            }
+            let unit_cost = lot.entry_cost / lot.qty;
+            let floor = unit_cost * (1.0 - self.max_lot_loss_frac);
+            let raw = mid.max(floor);
+            // At the loss floor, round UP so the realized loss never exceeds the
+            // cap; above it (near the mid) round DOWN so the exit stays marketable.
+            let target = if raw <= floor + 1e-12 {
+                (floor * m).ceil() / m
+            } else {
+                (raw * m).floor() / m
+            };
+            if target >= lot.exit_price {
+                continue; // capitulation only ever moves an exit down
+            }
+            crate::logger::log_warn(
+                "[GRID]",
+                &format!(
+                    "Capitulating stranded lot: entry {:.prec$} qty {:.8}, mid {:.prec$} is ≥ {:.1}× spacing below entry — exit {:.prec$} → {:.prec$} (loss cap {:.1}%).",
+                    lot.entry_price,
+                    lot.qty,
+                    mid,
+                    self.capitulate_band,
+                    lot.exit_price,
+                    target,
+                    self.max_lot_loss_frac * 100.0,
+                    prec = prec
+                ),
+            );
+            lot.exit_price = target;
+            any = true;
+        }
+        if !any {
+            return vec![];
+        }
+
+        // Rebuild the sell ladder from the (adjusted) lots so `sell_orders` stays
+        // consistent with `book.lots` even when levels are shared. Cheap: this
+        // only runs on a capitulation tick.
+        let mut signals = Vec::new();
+        for &(price, _) in self.sell_orders.values() {
+            signals.push(TradeSignal::Cancel {
+                price,
+                is_buy: false,
+                reason: format!("Capitulate: rebuild exit ladder, cancel {:.prec$}", price, prec = prec),
+            });
+        }
+        self.sell_orders.clear();
+        self.emitted_sell_prices.clear();
+        let exits: Vec<(f64, f64)> =
+            self.book.lots.iter().map(|l| (l.exit_price, l.qty)).collect();
+        for (exit, qty) in exits {
+            self.emit_exit(exit, qty, &mut signals);
+        }
+        signals
+    }
+
     fn rebuild_cooldown_active(&self, now: DateTime<Utc>) -> bool {
         self.last_rebuild_at
             .map(|t| now - t < chrono::Duration::seconds(REBUILD_COOLDOWN_SECS))
@@ -978,6 +1081,16 @@ impl Algorithm for GridBot {
             return signals;
         }
 
+        // Bounded capitulation (plan/13): a rebuild/re-center above takes
+        // precedence; only when neither could help (no funds, or one-sided with
+        // no resting buys) do we cut stranded lots to keep the runner two-sided.
+        let stuck = self.unfundable || self.buy_orders.is_empty();
+        let cap = self.capitulate(price, stuck);
+        if !cap.is_empty() {
+            self.last_price = Some(price);
+            return cap;
+        }
+
         let prev_price = self.last_price.unwrap();
         let mut signals: Vec<TradeSignal> = Vec::new();
         let prec = self.price_decimals as usize;
@@ -1016,6 +1129,19 @@ impl Algorithm for GridBot {
             }
         }
 
+        self.last_price = Some(price);
+        signals
+    }
+
+    fn on_halt_tick(&mut self, tick: &MarketData) -> Vec<TradeSignal> {
+        let price = (tick.bid + tick.ask) / 2.0;
+        if price <= 0.0 {
+            return vec![];
+        }
+        // Halted → the runner cancelled resting buys externally, so force the
+        // stuck condition. Capitulation is the only maintenance a halted runner
+        // performs; it never emits a new buy.
+        let signals = self.capitulate(price, true);
         self.last_price = Some(price);
         signals
     }
@@ -2040,5 +2166,81 @@ mod tests {
         assert_eq!(exits.len(), 2);
         let prices = sell_prices(&exits);
         assert!(prices.contains(&110.0) && prices.contains(&100.0), "got {:?}", prices);
+    }
+
+    #[test]
+    fn capitulation_only_fires_when_stuck() {
+        // Lot at 90 with its exit at 100. Mid 20 is > 6 × spacing (10) below entry.
+        let mut g = GridBot::new(&base_opts()).unwrap();
+        g.build_grid(100.0);
+        g.on_fill(90.0, true, 90.0);
+        assert!((g.book.lots[0].entry_price - 90.0).abs() < 1e-9);
+
+        // Fundable, two-sided grid → never capitulates, however far price drifts.
+        assert!(g.capitulate(20.0, false).is_empty(), "fundable grid must not capitulate");
+
+        // Stuck → the stranded exit is cancelled and re-placed lower.
+        let sigs = g.capitulate(20.0, true);
+        assert!(count_cancels(&sigs) >= 1, "old exit cancelled");
+        assert!(count_sells(&sigs) >= 1, "new lower exit placed");
+        assert!(g.book.lots[0].exit_price < 100.0, "exit re-priced down");
+    }
+
+    #[test]
+    fn capitulation_ignores_lots_inside_the_band() {
+        // Lot at 90, exit 100; mid 85 is only 0.5 × spacing below entry (< 6×).
+        let mut g = GridBot::new(&base_opts()).unwrap();
+        g.build_grid(100.0);
+        g.on_fill(90.0, true, 90.0);
+        assert!(g.capitulate(85.0, true).is_empty(), "a lot inside the band is not stranded");
+        assert!((g.book.lots[0].exit_price - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capitulation_bounds_the_loss_to_the_cap() {
+        // spacing 0.10 → 2 decimals. Lot at 90 (zero fee), max_lot_loss_frac 0.03
+        // → floor 87.30. Mid 50 is far below the floor, so the exit parks at the
+        // floor (rounded so the loss never exceeds 3%), not at the mid.
+        let o = opts(&[
+            ("levels", "3"),
+            ("qty", "1"),
+            ("spacing", "0.10"),
+            ("trend_filter", "off"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(90.0);
+        g.on_fill(90.0, true, 90.0);
+        g.capitulate(50.0, true);
+        let exit = g.book.lots[0].exit_price;
+        let loss_frac = (90.0 - exit) / 90.0;
+        assert!(exit >= 87.30 - 1e-9, "exit {} must not fall below the loss floor", exit);
+        assert!(loss_frac <= 0.03 + 1e-9, "loss {:.4} must be within the 3% cap", loss_frac);
+    }
+
+    #[test]
+    fn halted_tick_capitulates_but_emits_no_buys() {
+        // A held lot far above the mid, with the buy ladder cancelled (halt).
+        let mut g = GridBot::new(&base_opts()).unwrap();
+        g.build_grid(100.0);
+        g.on_fill(90.0, true, 90.0);
+        g.buy_orders.clear(); // the runner cancels resting buys on halt
+        let sigs = g.on_halt_tick(&tick(20.0, 0));
+        assert!(!has_buy(&sigs), "a halted tick must never emit a new buy");
+        assert!(count_sells(&sigs) >= 1, "halted tick still cuts the stranded lot");
+    }
+
+    #[test]
+    fn capitulation_disabled_is_a_noop() {
+        let o = opts(&[
+            ("levels", "3"),
+            ("qty", "1"),
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+            ("capitulate_enabled", "false"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        g.on_fill(90.0, true, 90.0);
+        assert!(g.capitulate(20.0, true).is_empty(), "disabled → strict never-sell-below-cost");
     }
 }
