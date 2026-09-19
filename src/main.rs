@@ -660,6 +660,7 @@ async fn handle_control_command(
                 .unwrap_or((false, None, None));
             return crate::operator::status_json(
                 status_cache, hold, reason.as_deref(), last.as_deref(), net, loss,
+                &op.guardrails,
             );
         }
         CliAction::ClearHold => {

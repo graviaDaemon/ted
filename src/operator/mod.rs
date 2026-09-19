@@ -9,6 +9,7 @@ pub mod breaker;
 pub mod control;
 pub mod guardrails;
 
+use crate::config::config::Guardrails;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -34,8 +35,10 @@ pub struct StatusSnapshot {
 
 pub type StatusCache = HashMap<String, StatusSnapshot>;
 
-/// Build the JSON reply for a `status` command: per-runner snapshots plus
-/// account-level month-to-date PnL, the breaker hold flag, and last-change ts.
+/// Build the JSON reply for a `status` command: per-runner snapshots, account-level
+/// month-to-date PnL, the breaker hold flag, last-change ts, and the guardrail
+/// limits. The guardrails are T.E.D's single source of truth for pair/capital
+/// policy — the operator (Lara) reads them here instead of keeping its own copy.
 pub fn status_json(
     cache: &StatusCache,
     hold: bool,
@@ -43,6 +46,7 @@ pub fn status_json(
     last_config_change: Option<&str>,
     month_net_realized: f64,
     month_loss_pct: f64,
+    guardrails: &Guardrails,
 ) -> String {
     let mut runners: Vec<&StatusSnapshot> = cache.values().collect();
     runners.sort_by(|a, b| a.symbol.cmp(&b.symbol));
@@ -53,6 +57,12 @@ pub fn status_json(
         "month_net_realized": month_net_realized,
         "month_loss_pct": month_loss_pct,
         "runners": runners,
+        "guardrails": {
+            "whitelisted_pairs": guardrails.whitelisted_pairs,
+            "max_capital_per_pair": guardrails.max_capital_per_pair,
+            "min_days_between_config_changes": guardrails.min_days_between_config_changes,
+            "max_monthly_loss_pct": guardrails.max_monthly_loss_pct,
+        },
     });
     serde_json::to_string(&value).unwrap_or_else(|_| "{\"error\":\"serialize\"}".to_string())
 }
