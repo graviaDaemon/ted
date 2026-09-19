@@ -33,6 +33,32 @@ pub struct StatusSnapshot {
     pub pnl_7d_pct: Option<f64>,
 }
 
+impl StatusSnapshot {
+    /// A zeroed placeholder inserted the moment a runner is spawned, so `status`
+    /// reports the runner immediately instead of an empty list until its first
+    /// periodic Status event arrives. Without it the operator reads zero runners
+    /// in the seconds after a (crash-)restart and acts blind. The first real
+    /// Status event overwrites this.
+    pub fn seed(symbol: &str, mode: &str) -> Self {
+        StatusSnapshot {
+            symbol: symbol.to_string(),
+            mode: mode.to_string(),
+            realized: 0.0,
+            unrealized: 0.0,
+            equity: 0.0,
+            position: 0.0,
+            open_buys: 0,
+            open_sells: 0,
+            paused: false,
+            halted: false,
+            fees_paid: 0.0,
+            open_lots: 0,
+            trend: None,
+            pnl_7d_pct: None,
+        }
+    }
+}
+
 pub type StatusCache = HashMap<String, StatusSnapshot>;
 
 /// Build the JSON reply for a `status` command: per-runner snapshots, account-level

@@ -562,6 +562,21 @@ async fn run_headless(
             line.push_str(" --paper");
         }
         dispatch_line(&mut runner_txs, &mut runner_handles, &line, &config, &engine_handle, &exchange).await;
+        // Seed the status cache so the operator sees this runner immediately,
+        // before its first periodic Status event — otherwise a pass in the first
+        // seconds after a restart reads an empty runner list and acts blind.
+        if runner_txs.contains_key(&spec.symbol) {
+            let mode = if spec.live {
+                "live"
+            } else if spec.paper || config.startup_defaults.paper {
+                "paper"
+            } else {
+                "simulation"
+            };
+            status_cache
+                .entry(spec.symbol.clone())
+                .or_insert_with(|| crate::operator::StatusSnapshot::seed(&spec.symbol, mode));
+        }
     }
 
     // A persisted hold survives restart: re-halt on boot so a crash never
