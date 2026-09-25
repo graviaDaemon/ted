@@ -232,6 +232,11 @@ impl RunnerState {
             trend: self.algorithm.trend_state().map(str::to_string),
             pnl_7d_pct,
             idle_since: self.idle_since.map(|t| t.to_rfc3339()),
+            capital: self.options.get("capital").and_then(|v| v.parse().ok()),
+            quote_available: self
+                .wallet_balances
+                .get(&extract_currencies(&self.symbol).1)
+                .map(|&(_, available)| available),
         });
 
         let Some(runner_id) = self.runner_db_id else {

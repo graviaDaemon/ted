@@ -928,7 +928,7 @@ impl GridBot {
         self.emitted_sell_prices = HashSet::new();
         self.qty = legacy.qty;
         self.levels_per_side = legacy.levels_per_side;
-        self.sized = legacy.sized;
+        self.sized = legacy.sized && self.capital.is_none();
         self.base_seeded = legacy.base_seeded;
         self.unfundable = legacy.unfundable;
 
@@ -1423,7 +1423,7 @@ impl Algorithm for GridBot {
         self.emitted_sell_prices = state.emitted_sell_prices;
         self.qty = state.qty;
         self.levels_per_side = state.levels_per_side;
-        self.sized = state.sized;
+        self.sized = state.sized && self.capital.is_none();
         self.base_seeded = state.base_seeded;
         self.unfundable = state.unfundable;
         crate::logger::log_info(
@@ -2046,6 +2046,22 @@ mod tests {
     }
 
     #[test]
+    fn restored_unfundable_state_resizes_on_next_tick() {
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.on_tick(&tick(100.0, 0));
+        g.buy_orders.clear();
+        g.unfundable = true;
+        let json = g.serialize_state().unwrap();
+
+        let mut restored = GridBot::new(&o).unwrap();
+        restored.restore_state(&json);
+        let sigs = restored.on_tick(&tick(100.0, 10));
+        assert!(has_buy(&sigs), "a restored capital grid must re-size and place buys");
+        assert!(!restored.unfundable);
+    }
+
+    #[test]
     fn no_base_is_buy_first_with_empty_sell_ladder() {
         let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
         let mut g = GridBot::new(&o).unwrap();
@@ -2097,7 +2113,8 @@ mod tests {
         restored.restore_state(&json);
         assert!((restored.qty - g.qty).abs() < 1e-9, "derived qty must survive restore");
         assert_eq!(restored.levels_per_side, g.levels_per_side);
-        assert!(restored.sized && restored.base_seeded);
+        assert!(restored.base_seeded);
+        assert!(!restored.sized, "a capital grid re-sizes after restore (plan/14a)");
         assert!((restored.book.position() - g.book.position()).abs() < 1e-9);
     }
 

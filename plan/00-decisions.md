@@ -356,3 +356,19 @@ the remaining defect is in the grid's own maintenance loop. Full evidence in the
   **Why:** The control reply was a bare `OK`, so Lara never received a report (retune/cold-start
   silently dead: "no recommended options" every pass) while each pass littered the working dir
   with report files (20–30 found on the server). Lara consumes the text; nobody reads those files.
+
+## 2026-09-25 — plan/14a: post-deploy addendum (proposed)
+
+- **Decision:** A restored capital-sized grid always re-sizes (`sized = false` on restore).
+  **Why:** Resume restored `sized`/`unfundable`/`last_price`, so both runners came back latched
+  idle after the plan/14 deploy and needed a manual `--rebuild`.
+
+- **Decision:** `configure` over the control surface returns `ERR` until plan/15 designs it.
+  **Why:** It was a silent no-op (Lara's options lack `spacing`) that still replied `OK` and
+  stamped `last_config_change`; a working swap would also drop the lot book and be undone by
+  restart.
+
+- **Decision:** Lara sweeps with the runner's own `capital` (new status field) and stops
+  compounding; T.E.D already sizes from `capital + realized`.
+  **Why:** Sweeps defaulted to 10000 capital, and Lara's compounding read the shared-wallet
+  equity (identical for every runner) — it would have set every pair to the cap.

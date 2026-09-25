@@ -808,12 +808,14 @@ fn apply_tui_event(cache: &mut crate::operator::StatusCache, ev: TuiEvent) {
         TuiEvent::Status {
             symbol, mode, realized, unrealized, equity, position,
             open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct, idle_since,
+            capital, quote_available,
         } => {
             cache.insert(
                 symbol.clone(),
                 crate::operator::StatusSnapshot {
                     symbol, mode, realized, unrealized, equity, position,
                     open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct, idle_since,
+                    capital, quote_available,
                 },
             );
         }

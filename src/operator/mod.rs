@@ -32,6 +32,10 @@ pub struct StatusSnapshot {
     pub trend: Option<String>,
     pub pnl_7d_pct: Option<f64>,
     pub idle_since: Option<String>,
+    pub capital: Option<f64>,
+    /// Account-level (shared wallet) — served once at the top of `status`.
+    #[serde(skip)]
+    pub quote_available: Option<f64>,
 }
 
 impl StatusSnapshot {
@@ -57,6 +61,8 @@ impl StatusSnapshot {
             trend: None,
             pnl_7d_pct: None,
             idle_since: None,
+            capital: None,
+            quote_available: None,
         }
     }
 }
@@ -78,8 +84,10 @@ pub fn status_json(
 ) -> String {
     let mut runners: Vec<&StatusSnapshot> = cache.values().collect();
     runners.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    let quote_available = runners.iter().find_map(|r| r.quote_available);
     let value = serde_json::json!({
         "hold": hold,
+        "quote_available": quote_available,
         "hold_reason": hold_reason,
         "last_config_change": last_config_change,
         "month_net_realized": month_net_realized,

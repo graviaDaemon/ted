@@ -23,11 +23,11 @@ pub fn check(
             reject_churn(now, last_config_change, g.min_days_between_config_changes)?;
             Ok(())
         }
-        CliAction::Configure { options, .. } => {
-            reject_over_capital(options, g.max_capital_per_pair)?;
-            reject_churn(now, last_config_change, g.min_days_between_config_changes)?;
-            Ok(())
-        }
+        // The runner-side swap is a silent no-op for operator options (no `spacing`) and
+        // would drop the lot book — reject until plan/15 designs it.
+        CliAction::Configure { .. } => Err(
+            "configure is not supported over the control surface yet (see plan/15) — kill + spawn instead".into(),
+        ),
         // Reducing/closing risk and read-only ops are always allowed.
         CliAction::Kill { .. }
         | CliAction::Pause { .. }
@@ -172,6 +172,16 @@ mod tests {
         let alert = CliAction::Alert { message: "idle".to_string() };
         assert!(check(&rebuild, &op(), now, recent).is_ok());
         assert!(check(&alert, &op(), now, recent).is_ok());
+    }
+
+    #[test]
+    fn configure_is_rejected() {
+        let configure = CliAction::Configure {
+            symbol: "tSOLUSD".to_string(),
+            algorithm: "grid".to_string(),
+            options: HashMap::new(),
+        };
+        assert!(check(&configure, &op(), Utc::now(), None).is_err());
     }
 
     #[test]

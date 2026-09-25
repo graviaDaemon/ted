@@ -43,6 +43,10 @@ pub enum TuiEvent {
         pnl_7d_pct: Option<f64>,
         /// RFC 3339 time since which no order has rested; None while any does.
         idle_since: Option<String>,
+        /// Configured `capital` option; None for explicit-qty runners (plan/14a).
+        capital: Option<f64>,
+        /// Free quote in the (shared) wallet from the latest wallet update.
+        quote_available: Option<f64>,
     },
     RunnerStopped {
         symbol: String,
