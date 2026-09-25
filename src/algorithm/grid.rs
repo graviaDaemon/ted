@@ -614,9 +614,9 @@ impl GridBot {
     /// (plan/08 step 4): profits grow it, losses shrink it, clamped at zero.
     /// Reserves `buy_reserve_frac` to fund the buy ladder; derives the effective
     /// `levels_per_side` from `levels_requested` so each level clears
-    /// `min_notional` (non-destructive — a grown budget restores levels); caps
-    /// `qty` by held base so the sell ladder is fundable too. Flags the runner
-    /// `unfundable` (and warns) if the budget cannot fund even one level.
+    /// `min_notional` (non-destructive — a grown budget restores levels),
+    /// stepping down past rounding knife-edges (plan/14). Flags the runner
+    /// `unfundable` only if not even one level clears the floor.
     fn size_from_capital(&mut self, midpoint: f64) {
         let Some(capital) = self.capital else {
             return;
@@ -627,23 +627,31 @@ impl GridBot {
 
         let effective = (capital + self.book.realized_pnl).max(0.0);
         let buy_budget = effective * self.buy_reserve_frac;
-        // Each level costs ~ buy_budget / levels in quote; cap levels so that
-        // per-level notional stays >= min_notional.
         let max_fundable = (buy_budget / self.min_notional).floor() as u32;
-        if max_fundable < 1 {
+        let fundable = (1..=self.levels_requested.min(max_fundable))
+            .rev()
+            .map(|levels| (levels, Self::round_qty(buy_budget / (levels as f64 * midpoint))))
+            .find(|&(_, qty)| qty > 0.0 && qty * midpoint >= self.min_notional - 1e-9);
+
+        let Some((levels, qty)) = fundable else {
+            let was_unfundable = self.unfundable;
             self.unfundable = true;
             self.qty = 0.0;
-            crate::logger::log_warn(
-                "[GRID]",
-                &format!(
-                    "Budget {:.2} (capital {:.2} + realized {:+.2}; buy budget {:.2} = budget × {:.2}) cannot fund a single level at min_notional {:.2} — emitting no orders. Increase capital or lower min_notional.",
-                    effective, capital, self.book.realized_pnl, buy_budget, self.buy_reserve_frac, self.min_notional
-                ),
+            let msg = format!(
+                "Budget {:.2} (capital {:.2} + realized {:+.2}; buy budget {:.2} = budget × {:.2}) cannot fund a single level at min_notional {:.2} (midpoint {:.2}) — emitting no orders. Increase capital or lower min_notional.",
+                effective, capital, self.book.realized_pnl, buy_budget, self.buy_reserve_frac, self.min_notional, midpoint
             );
+            if was_unfundable {
+                crate::logger::log_warn("[GRID]", &msg);
+            } else {
+                crate::logger::log_critical(
+                    "[GRID]",
+                    &format!("Runner cannot fund a single level — no orders will be placed. {}", msg),
+                );
+            }
             return;
-        }
+        };
 
-        let levels = self.levels_requested.min(max_fundable);
         if levels < self.levels_requested {
             crate::logger::log_warn(
                 "[GRID]",
@@ -654,30 +662,6 @@ impl GridBot {
             );
         }
         self.levels_per_side = levels;
-
-        let qty_from_quote = buy_budget / (levels as f64 * midpoint);
-        let qty = if self.initial_base_balance > 0.0 {
-            // Hold base already: size so both ladders are fundable from inventory.
-            let qty_from_base = self.initial_base_balance / levels as f64;
-            qty_from_quote.min(qty_from_base)
-        } else {
-            qty_from_quote
-        };
-        let qty = Self::round_qty(qty);
-
-        if qty <= 0.0 || qty * midpoint < self.min_notional - 1e-9 {
-            self.unfundable = true;
-            self.qty = 0.0;
-            crate::logger::log_warn(
-                "[GRID]",
-                &format!(
-                    "Derived per-level notional {:.2} (qty {:.8} × midpoint {:.2}) is below min_notional {:.2} — emitting no orders.",
-                    qty * midpoint, qty, midpoint, self.min_notional
-                ),
-            );
-            return;
-        }
-
         self.qty = qty;
         self.unfundable = false;
         crate::logger::log_info(
@@ -1304,6 +1288,13 @@ impl Algorithm for GridBot {
         if ema > 0.0 {
             self.trend_ema = Some(ema);
         }
+    }
+
+    fn on_rebuild(&mut self) {
+        self.buy_orders.clear();
+        self.emitted_buy_prices.clear();
+        self.sized = false;
+        self.last_rebuild_at = None;
     }
 
     fn on_reconnect(&mut self) {
@@ -2001,6 +1992,57 @@ mod tests {
         assert!(!g.unfundable);
         // Each level clears min_notional: qty = 60 / (2 × 100) = 0.3 → 0.3 × 100 = 30 ≥ 25.
         assert!(g.qty * 100.0 >= 25.0 - 1e-9, "per-level notional {}", g.qty * 100.0);
+    }
+
+    #[test]
+    fn xmr_knife_edge_steps_down_levels() {
+        // The 2026-09-19 freeze: 150 × 0.5 / 3 = 25.00/level exactly; rounding
+        // (and the old held-base cap) dipped it below min_notional → unfundable.
+        let o = opts(&[
+            ("levels", "3"),
+            ("capital", "150"),
+            ("min_notional", "25"),
+            ("spacing", "5"),
+            ("trend_filter", "off"),
+            ("initial_base_balance", "0.12636801"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(589.08);
+        assert!(!g.unfundable, "knife-edge must step down, not latch unfundable");
+        assert_eq!(g.levels_per_side, 2);
+        assert!(g.qty * 589.08 >= 25.0, "per-level notional {}", g.qty * 589.08);
+    }
+
+    #[test]
+    fn held_base_does_not_cap_qty() {
+        let o = opts(&[
+            ("levels", "3"),
+            ("capital", "170"),
+            ("spacing", "10"),
+            ("trend_filter", "off"),
+            ("initial_base_balance", "0.3"),
+        ]);
+        let mut g = GridBot::new(&o).unwrap();
+        g.build_grid(100.0);
+        assert!((g.qty - GridBot::round_qty(85.0 / 300.0)).abs() < 1e-12, "qty {}", g.qty);
+        assert_eq!(g.levels_per_side, 3);
+    }
+
+    #[test]
+    fn rebuild_resizes_and_rebuilds_ladder() {
+        let o = opts(&[("levels", "3"), ("capital", "600"), ("spacing", "10"), ("trend_filter", "off")]);
+        let mut g = GridBot::new(&o).unwrap();
+        assert!(has_buy(&g.on_tick(&tick(100.0, 0))));
+        g.on_fill(90.0, true, 90.0); // a lot + exit so the ladder isn't fully empty
+        g.buy_orders.clear();
+        g.unfundable = true;
+        g.last_rebuild_at = Some(tick(100.0, 5).timestamp);
+
+        g.on_rebuild();
+        let sigs = g.on_tick(&tick(100.0, 10));
+        assert!(has_buy(&sigs), "rebuild must emit a fresh buy ladder");
+        assert!(!g.unfundable);
+        assert!(!g.sell_orders.is_empty(), "lot exits survive the rebuild");
     }
 
     #[test]

@@ -41,6 +41,8 @@ pub enum TuiEvent {
         trend: Option<String>,
         /// Trailing 7-day PnL% from daily rollups; None with < 2 rollup days.
         pnl_7d_pct: Option<f64>,
+        /// RFC 3339 time since which no order has rested; None while any does.
+        idle_since: Option<String>,
     },
     RunnerStopped {
         symbol: String,
@@ -66,6 +68,9 @@ pub enum RunnerControl {
     /// Retire this pair cleanly (plan/12): stop opening, keep working the exit
     /// ladder, and shut the runner down once flat (position ≈ 0, no resting sells).
     FinishExits,
+    /// Operator nudge (plan/14): cancel resting buys and re-size + rebuild the
+    /// buy ladder on the next tick. Exits stay resting; config is unchanged.
+    Rebuild,
     /// Clean app-wide shutdown (Ctrl-D / restart): persist resume state and exit
     /// WITHOUT cancelling resting orders, so the next launch reconciles against
     /// them. Distinct from `Kill`, which cancels orders and forgets the runner.

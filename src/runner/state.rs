@@ -49,6 +49,9 @@ pub struct RunnerState {
     /// Not persisted — a restart mid-finish resumes normal trading, which is safe.
     pub finishing: bool,
     pub daily: Option<DailyAgg>,
+    /// First status emission with no resting orders (plan/14); None while any
+    /// order rests. In-memory only — a restart is itself a rebuild.
+    pub idle_since: Option<DateTime<Utc>>,
 }
 
 impl RunnerState {
@@ -207,6 +210,12 @@ impl RunnerState {
                 }
             });
 
+        if self.pending_buy_orders.is_empty() && self.pending_sell_orders.is_empty() && !self.finishing {
+            self.idle_since.get_or_insert(now);
+        } else {
+            self.idle_since = None;
+        }
+
         crate::logger::notify_tui(TuiEvent::Status {
             symbol: self.symbol.clone(),
             mode: crate::runner::mode_label(&self.mode).to_string(),
@@ -222,6 +231,7 @@ impl RunnerState {
             open_lots: self.algorithm.open_lots(),
             trend: self.algorithm.trend_state().map(str::to_string),
             pnl_7d_pct,
+            idle_since: self.idle_since.map(|t| t.to_rfc3339()),
         });
 
         let Some(runner_id) = self.runner_db_id else {

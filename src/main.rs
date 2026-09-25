@@ -446,67 +446,16 @@ async fn dispatch(
             }
         }
 
-        CliAction::Sweep {
-            symbol,
-            timeframe,
-            limit,
-            from_file,
-            spacings,
-            levels,
-            capital,
-            spread,
-            maker_fee,
-            taker_fee,
-            start_quote,
-            start_base,
-        } => {
-            let candles = if let Some(path) = &from_file {
-                crate::backtest::load_candles_from_file(path)
-            } else {
-                exchange.fetch_candle_history(&symbol, &timeframe, limit).await
-            };
+        CliAction::Rebuild { symbol } => {
+            send_control(runner_txs, runner_handles, &symbol, RunnerControl::Rebuild).await;
+        }
 
-            let candles = match candles {
-                Ok(c) => c,
-                Err(e) => {
-                    logger::log("[SWEEP]", &format!("Failed to load candles: {}", e));
-                    return;
-                }
-            };
+        CliAction::Alert { message } => {
+            logger::log("[CTRL]", &format!("alert is only sent over the headless control surface: {}", message));
+        }
 
-            // The budget each combination sizes from and the replay wallet
-            // default to each other, so passing just --capital replays the
-            // exact funded reality.
-            let (capital, start_quote) = match (capital, start_quote) {
-                (Some(c), Some(q)) => (c, q),
-                (Some(c), None) => (c, c),
-                (None, Some(q)) => (q, q),
-                (None, None) => (10_000.0, 10_000.0),
-            };
-
-            logger::log(
-                "[SWEEP]",
-                &format!(
-                    "Loaded {} candles for {} — sweeping spacing × levels…",
-                    candles.len(),
-                    symbol
-                ),
-            );
-
-            let sweep_cfg = crate::backtest::sweep::SweepConfig {
-                symbol: symbol.clone(),
-                timeframe,
-                capital,
-                spacings,
-                levels,
-                spread,
-                maker_fee,
-                taker_fee,
-                start_quote_balance: start_quote,
-                start_base_balance: start_base,
-            };
-
-            match crate::backtest::sweep::run_sweep(&sweep_cfg, &candles) {
+        action @ CliAction::Sweep { .. } => {
+            match run_sweep_action(action, exchange).await {
                 Ok(result) => {
                     for line in result.render_console().lines() {
                         logger::log("[SWEEP]", line);
@@ -528,6 +477,70 @@ async fn dispatch(
 
         CliAction::Exit => {}
     }
+}
+
+async fn run_sweep_action(
+    action: CliAction,
+    exchange: &Arc<dyn Exchange>,
+) -> Result<crate::backtest::sweep::SweepResult, String> {
+    let CliAction::Sweep {
+        symbol,
+        timeframe,
+        limit,
+        from_file,
+        spacings,
+        levels,
+        capital,
+        spread,
+        maker_fee,
+        taker_fee,
+        start_quote,
+        start_base,
+    } = action
+    else {
+        return Err("not a sweep".to_string());
+    };
+
+    let candles = if let Some(path) = &from_file {
+        crate::backtest::load_candles_from_file(path)
+    } else {
+        exchange.fetch_candle_history(&symbol, &timeframe, limit).await
+    }
+    .map_err(|e| format!("Failed to load candles: {}", e))?;
+
+    // The budget each combination sizes from and the replay wallet
+    // default to each other, so passing just --capital replays the
+    // exact funded reality.
+    let (capital, start_quote) = match (capital, start_quote) {
+        (Some(c), Some(q)) => (c, q),
+        (Some(c), None) => (c, c),
+        (None, Some(q)) => (q, q),
+        (None, None) => (10_000.0, 10_000.0),
+    };
+
+    logger::log(
+        "[SWEEP]",
+        &format!(
+            "Loaded {} candles for {} — sweeping spacing × levels…",
+            candles.len(),
+            symbol
+        ),
+    );
+
+    let sweep_cfg = crate::backtest::sweep::SweepConfig {
+        symbol,
+        timeframe,
+        capital,
+        spacings,
+        levels,
+        spread,
+        maker_fee,
+        taker_fee,
+        start_quote_balance: start_quote,
+        start_base_balance: start_base,
+    };
+
+    crate::backtest::sweep::run_sweep(&sweep_cfg, &candles)
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +707,23 @@ async fn handle_control_command(
             }
             return "OK hold cleared, runners resumed".to_string();
         }
+        CliAction::Alert { message } => {
+            let email = op.email.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::notify::send_email(email.as_ref(), "T.E.D operator alert", &message).await {
+                    logger::log_warn("[NOTIFY]", &format!("Operator alert email failed: {}", e));
+                }
+            });
+            return "OK alert sent".to_string();
+        }
+        CliAction::Sweep { .. } => {
+            // Reply with the report instead of writing a file (plan/14 §6).
+            return match run_sweep_action(action, exchange).await {
+                Ok(result) => format!("OK\n{}", result.render_console()),
+                Err(e) => format!("ERR {}", e),
+            };
+        }
         _ => {}
     }
 
@@ -777,13 +807,13 @@ fn apply_tui_event(cache: &mut crate::operator::StatusCache, ev: TuiEvent) {
     match ev {
         TuiEvent::Status {
             symbol, mode, realized, unrealized, equity, position,
-            open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct,
+            open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct, idle_since,
         } => {
             cache.insert(
                 symbol.clone(),
                 crate::operator::StatusSnapshot {
                     symbol, mode, realized, unrealized, equity, position,
-                    open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct,
+                    open_buys, open_sells, paused, halted, fees_paid, open_lots, trend, pnl_7d_pct, idle_since,
                 },
             );
         }

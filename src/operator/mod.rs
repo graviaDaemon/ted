@@ -31,6 +31,7 @@ pub struct StatusSnapshot {
     pub open_lots: usize,
     pub trend: Option<String>,
     pub pnl_7d_pct: Option<f64>,
+    pub idle_since: Option<String>,
 }
 
 impl StatusSnapshot {
@@ -55,6 +56,7 @@ impl StatusSnapshot {
             open_lots: 0,
             trend: None,
             pnl_7d_pct: None,
+            idle_since: None,
         }
     }
 }

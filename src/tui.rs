@@ -188,6 +188,7 @@ impl Tui {
                 open_lots,
                 trend,
                 pnl_7d_pct,
+                ..
             } => {
                 let entry = self.statuses.entry(symbol).or_insert_with(StatusEntry::new);
                 entry.mode = Some(mode);

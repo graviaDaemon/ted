@@ -33,6 +33,8 @@ pub fn check(
         | CliAction::Pause { .. }
         | CliAction::Resume { .. }
         | CliAction::FinishExits { .. }
+        | CliAction::Rebuild { .. }
+        | CliAction::Alert { .. }
         | CliAction::Generate { .. }
         | CliAction::Backtest { .. }
         | CliAction::Sweep { .. }
@@ -160,6 +162,16 @@ mod tests {
         assert!(check(&spawn("tSOLUSD", None), &op(), now, Some(recent)).is_err());
         let old = now - chrono::Duration::days(20);
         assert!(check(&spawn("tSOLUSD", None), &op(), now, Some(old)).is_ok());
+    }
+
+    #[test]
+    fn rebuild_and_alert_allowed_inside_churn_window() {
+        let now = Utc::now();
+        let recent = Some(now - chrono::Duration::days(1));
+        let rebuild = CliAction::Rebuild { symbol: "tXMRUSD".to_string() };
+        let alert = CliAction::Alert { message: "idle".to_string() };
+        assert!(check(&rebuild, &op(), now, recent).is_ok());
+        assert!(check(&alert, &op(), now, recent).is_ok());
     }
 
     #[test]

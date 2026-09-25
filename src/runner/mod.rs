@@ -475,6 +475,7 @@ pub async fn run_runner(
         halted: false,
         finishing: false,
         daily: None,
+        idle_since: None,
     };
 
     if resume {
@@ -728,6 +729,12 @@ pub async fn run_runner(
                         state.finishing = true;
                         crate::logger::log(&src, "FinishExits received — stop opening, working exits until flat, then retire.");
                         cancel_live_buy_orders(&mut state, &engine).await;
+                    }
+
+                    Some(RunnerControl::Rebuild) => {
+                        cancel_live_buy_orders(&mut state, &engine).await;
+                        state.algorithm.on_rebuild();
+                        crate::logger::log(&src, "Rebuild received — buys cancelled, grid re-sized on next tick.");
                     }
 
                     Some(RunnerControl::SetAlgorithm { name, options }) => {

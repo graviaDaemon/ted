@@ -331,3 +331,28 @@ the remaining defect is in the grid's own maintenance loop. Full evidence in the
   `min_profit_frac` (plan/09) is then the binding per-round-trip profit floor; sweeps/backtests
   should be run with 0 fees to match reality (the non-zero CLI defaults remain only as a
   safety fallback for fetch failure or other accounts).
+
+## 2026-09-25 — plan/14: fundable sizing + operator rebuild/alert
+
+- **Decision:** Remove the held-base cap from `size_from_capital` and step levels down until
+  one clears `min_notional`, instead of latching `unfundable`.
+  **Why:** The 2026-09-19 → 09-25 six-day stall: XMR held-base / 3 levels gave 24.81 < 25,
+  price-independent, so every re-center recomputed the same failing qty — no recovery path.
+  The cap is a pre-plan/09 relic (per-lot exits are sized per lot now).
+
+- **Decision:** Lara's stuck-runner action is a new risk-neutral `runner --rebuild` verb, not a
+  re-spawn; guardrails allow it outside the churn window.
+  **Why:** `Spawn`/`Configure` are churn-gated (14 days), and T.E.D doesn't retain spawn options.
+  Overriding the churn guardrail for re-spawn would weaken the un-bypassable governor; a rebuild
+  keeps the same config and capital, so it adds no risk the governor exists to stop.
+
+- **Decision:** Add an `alert <msg>` control verb (T.E.D sends the email) and an in-memory
+  `idle_since` status field. Skip `last_fill_at` for now.
+  **Why:** Email lives only in T.E.D; `idle_since` lets Lara apply a time threshold (12h) without
+  keeping her own pass-to-pass state. `last_fill_at` deferred until a resting-but-dead case shows up.
+
+- **Decision:** Control-surface `sweep` returns the console report in its reply and writes no
+  file; only the interactive TUI sweep still writes `sweep_*.md`.
+  **Why:** The control reply was a bare `OK`, so Lara never received a report (retune/cold-start
+  silently dead: "no recommended options" every pass) while each pass littered the working dir
+  with report files (20–30 found on the server). Lara consumes the text; nobody reads those files.

@@ -19,6 +19,9 @@ pub trait Algorithm: Send {
     }
     fn on_order_failed(&mut self, _price: f64, _is_buy: bool) {}
     fn on_reconnect(&mut self) {}
+    /// Operator `--rebuild` (plan/14): the runner has cancelled resting buys;
+    /// forget the buy ladder and re-size on the next tick. Exits stay resting.
+    fn on_rebuild(&mut self) {}
     fn on_spacing_update(&mut self, _new_spacing: f64) {}
     /// Push a fresh candle-close trend EMA into the strategy. Fed by the
     /// runner's periodic candle refresh live and by the backtester per candle,

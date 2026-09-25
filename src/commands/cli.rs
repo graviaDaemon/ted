@@ -27,6 +27,9 @@ impl Cli {
                 if run.finish_exits {
                     return Ok(CliAction::FinishExits { symbol });
                 }
+                if run.rebuild {
+                    return Ok(CliAction::Rebuild { symbol });
+                }
                 if let Some(alg) = &run.configure {
                     return Ok(CliAction::Configure {
                         symbol,
@@ -87,6 +90,7 @@ impl Cli {
             }
             RunCommand::Status => Ok(CliAction::Status),
             RunCommand::ClearHold => Ok(CliAction::ClearHold),
+            RunCommand::Alert(a) => Ok(CliAction::Alert { message: a.message.join(" ") }),
             RunCommand::Exit => Ok(CliAction::Exit),
         }
     }
@@ -129,7 +133,15 @@ pub enum RunCommand {
     Status,
     /// Headless control surface (plan/12): clear a circuit-breaker hold.
     ClearHold,
+    /// Headless control surface (plan/14): email the operator an alert.
+    Alert(AlertCommand),
     Exit,
+}
+
+#[derive(Args, Debug)]
+pub struct AlertCommand {
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    pub message: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -168,6 +180,10 @@ pub struct RunnerCommand {
     /// Stop opening, work exits until flat, then retire the runner (plan/12).
     #[arg(short = 'f', long, conflicts_with_all(["pause", "resume", "kill"]))]
     pub finish_exits: bool,
+
+    /// Cancel resting buys and re-size + rebuild the buy ladder; exits stay (plan/14).
+    #[arg(long, conflicts_with_all(["pause", "resume", "kill", "finish_exits"]))]
+    pub rebuild: bool,
 }
 
 #[derive(Args, Debug)]
@@ -291,8 +307,14 @@ pub enum CliAction {
     FinishExits {
         symbol: String,
     },
+    Rebuild {
+        symbol: String,
+    },
     Status,
     ClearHold,
+    Alert {
+        message: String,
+    },
     Generate {
         symbol: Option<String>,
         all: bool,
